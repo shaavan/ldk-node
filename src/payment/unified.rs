@@ -260,6 +260,10 @@ impl UnifiedPayment {
 			PaymentMethod::LightningBolt12(_) => 0,
 			PaymentMethod::LightningBolt11(_) => 1,
 			PaymentMethod::OnChain(_) => 2,
+			// Bark and Cashu are recognized by the URI parser but unsupported by this node.
+			// Keep them in ordering so every parsed method is handled deterministically.
+			PaymentMethod::Bark(_) => 3,
+			PaymentMethod::Cashu(_) => 4,
 		});
 
 		for method in sorted_payment_methods {
@@ -338,6 +342,9 @@ impl UnifiedPayment {
 						.await?;
 					return Ok(UnifiedPaymentResult::Onchain { txid });
 				},
+				// These methods are valid BIP 21 payment methods, but this node has no
+				// implementation for sending them. Continue to the next fallback method.
+				PaymentMethod::Bark(_) | PaymentMethod::Cashu(_) => {},
 			}
 		}
 
