@@ -1,6 +1,8 @@
 # Pending
 
 ## Compatibility Notes
+- `Bolt11Invoice::recover_payee_pub_key` now returns `Option<PublicKey>` in the Rust and FFI
+  APIs. Callers must handle `None` when payee-key recovery fails.
 - The language bindings now expose `Mnemonic` as an object instead of a string alias. Existing
   mnemonic phrases must be passed through its fallible constructor, which returns
   `NodeError::InvalidMnemonic` for invalid input; generated mnemonics can be converted back to a

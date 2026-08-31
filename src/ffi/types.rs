@@ -1509,8 +1509,11 @@ impl Bolt11Invoice {
 			.collect()
 	}
 
-	/// Recover the payee's public key (only to be used if none was included in the invoice)
-	pub fn recover_payee_pub_key(&self) -> PublicKey {
+	/// Recover the payee's public key (only to be used if none was included in the invoice).
+	///
+	/// Recovery can fail if the invoice does not contain enough information to recover the key.
+	/// In that case, this returns `None`.
+	pub fn recover_payee_pub_key(&self) -> Option<PublicKey> {
 		self.inner.recover_payee_pub_key()
 	}
 }

@@ -24,13 +24,14 @@ use lightning::events::{
 };
 use lightning::ln::channelmanager::{PaymentId, TrustedChannelFeatures};
 use lightning::ln::types::ChannelId;
+use lightning::offers::offer::OfferId;
 use lightning::routing::gossip::NodeId;
 use lightning::sign::EntropySource;
 use lightning::util::config::{ChannelConfigOverrides, ChannelConfigUpdate};
 use lightning::util::errors::APIError;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
-use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
@@ -84,7 +85,7 @@ pub struct HTLCLocator {
 	pub node_id: Option<PublicKey>,
 }
 
-impl_writeable_tlv_based!(HTLCLocator, {
+impl_ser_tlv_based!(HTLCLocator, {
 	(1, channel_id, required),
 	(3, user_channel_id, option),
 	(5, node_id, option),
@@ -160,6 +161,13 @@ pub enum Event {
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
 		custom_records: Vec<CustomTlvRecord>,
+	},
+	/// An incoming recurring payment has been cancelled by the payer.
+	IncomingPaymentCancelled {
+		/// The offer whose recurrence was cancelled.
+		offer_id: OfferId,
+		/// The payer signing pubkey used for this recurrence.
+		payer_signing_pubkey: PublicKey,
 	},
 	/// A payment has been forwarded.
 	PaymentForwarded {
@@ -308,7 +316,7 @@ pub enum Event {
 	},
 }
 
-impl_writeable_tlv_based_enum!(Event,
+impl_ser_tlv_based_enum!(Event,
 	(0, PaymentSuccessful) => {
 		(0, payment_hash, required),
 		(1, fee_paid_msat, option),
@@ -326,6 +334,10 @@ impl_writeable_tlv_based_enum!(Event,
 		(1, payment_id, required),
 		(2, amount_msat, required),
 		(3, custom_records, optional_vec),
+	},
+	(10, IncomingPaymentCancelled) => {
+		(0, offer_id, required),
+		(1, payer_signing_pubkey, required),
 	},
 	(3, ChannelReady) => {
 		(0, channel_id, required),
@@ -824,6 +836,17 @@ where
 				self.liquidity_source
 					.lsps2_service()
 					.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
+			},
+			LdkEvent::RecurringOfferCancelled { offer_id, payer_signing_pubkey } => {
+				let event = Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey };
+
+				match self.event_queue.add_event(event).await {
+					Ok(_) => {},
+					Err(e) => {
+						log_error!(self.logger, "Failed to push to event queue: {}", e);
+						return Err(ReplayEvent());
+					},
+				};
 			},
 			LdkEvent::PaymentClaimable {
 				payment_id,
@@ -2343,7 +2366,7 @@ mod tests {
 		},
 	}
 
-	impl_writeable_tlv_based_enum!(LegacyEvent,
+	impl_ser_tlv_based_enum!(LegacyEvent,
 		(5, ChannelClosed) => {
 			(0, channel_id, required),
 			(1, counterparty_node_id, option),
