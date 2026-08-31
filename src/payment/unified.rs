@@ -260,6 +260,8 @@ impl UnifiedPayment {
 			PaymentMethod::LightningBolt12(_) => 0,
 			PaymentMethod::LightningBolt11(_) => 1,
 			PaymentMethod::OnChain(_) => 2,
+			PaymentMethod::Bark(_) => 3,
+			PaymentMethod::Cashu(_) => 4,
 		});
 
 		for method in sorted_payment_methods {
@@ -338,6 +340,7 @@ impl UnifiedPayment {
 						.await?;
 					return Ok(UnifiedPaymentResult::Onchain { txid });
 				},
+				PaymentMethod::Bark(_) | PaymentMethod::Cashu(_) => {},
 			}
 		}
 
