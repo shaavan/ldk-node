@@ -147,6 +147,27 @@ pub(crate) struct RecurrenceState {
 
 pub(crate) type RecurrenceDetails = RecurrenceState;
 
+pub(crate) fn record_success(
+	details: &mut RecurrenceDetails, payment_id: PaymentId, basetime: u64,
+	next_state: Option<&[u8]>, period_index: u32, recurrence_limit: Option<u32>,
+) {
+	if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
+		return;
+	}
+	details.paid_count = details.paid_count.saturating_add(1);
+	details.basetime.get_or_insert(basetime);
+	details.opaque_state = next_state.map(|state| state.to_vec());
+	details.last_successful_payment_id = Some(payment_id);
+	details.attempt = None;
+	details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+	details.transition_id += 1;
+	if details.status.eq(&RecurrenceStatus::Active)
+		&& recurrence_limit.map(|limit| period_index >= limit).unwrap_or(false)
+	{
+		details.status = RecurrenceStatus::Completed;
+	}
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RecurrenceDetailsUpdate {
 	pub details: RecurrenceDetails,
@@ -560,5 +581,35 @@ mod tests {
 		let restarted = RecurrenceManager::new(store);
 		restarted.rebuild_index().await;
 		assert_eq!(restarted.get(&expected.id).await.unwrap().map(|v| v.id), Some(expected.id));
+	}
+
+	#[test]
+	fn successful_payment_advances_and_replay_is_idempotent() {
+		let mut details = state(Some(vec![1, 2]));
+		details.basetime = None;
+		details.paid_count = 0;
+		details.last_successful_payment_id = None;
+		details.status = RecurrenceStatus::Active;
+		record_success(&mut details, PaymentId([50; 32]), 100, Some(&[3, 4]), 0, Some(2));
+		assert_eq!(details.paid_count, 1);
+		assert_eq!(details.basetime, Some(100));
+		assert_eq!(details.opaque_state, Some(vec![3, 4]));
+		assert!(details.attempt.is_none());
+		let transition_id = details.transition_id;
+
+		record_success(&mut details, PaymentId([50; 32]), 200, None, 0, Some(2));
+		assert_eq!(details.paid_count, 1);
+		assert_eq!(details.basetime, Some(100));
+		assert_eq!(details.transition_id, transition_id);
+	}
+
+	#[test]
+	fn successful_payment_marks_completion_at_schedule_limit() {
+		let mut details = state(None);
+		details.paid_count = 1;
+		details.status = RecurrenceStatus::Active;
+		record_success(&mut details, PaymentId([51; 32]), 100, None, 1, Some(1));
+		assert_eq!(details.paid_count, 2);
+		assert_eq!(details.status, RecurrenceStatus::Completed);
 	}
 }
