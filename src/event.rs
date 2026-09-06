@@ -539,6 +539,21 @@ struct EventFuture {
 	waker: Arc<Mutex<Option<Waker>>>,
 }
 
+fn payment_sent_update(
+	payment_id: PaymentId, payment_hash: PaymentHash, payment_preimage: PaymentPreimage,
+	amount_msat: Option<u64>, fee_paid_msat: Option<u64>,
+) -> PaymentDetailsUpdate {
+	PaymentDetailsUpdate {
+		id: payment_id,
+		hash: Some(Some(payment_hash)),
+		preimage: Some(Some(payment_preimage)),
+		amount_msat: amount_msat.map(Some),
+		fee_paid_msat: Some(fee_paid_msat),
+		status: Some(PaymentStatus::Succeeded),
+		..PaymentDetailsUpdate::new(payment_id)
+	}
+}
+
 impl Future for EventFuture {
 	type Output = Event;
 
@@ -1426,14 +1441,13 @@ where
 					return Ok(());
 				};
 
-				let update = PaymentDetailsUpdate {
-					hash: Some(Some(payment_hash)),
-					preimage: Some(Some(payment_preimage)),
-					amount_msat: amount_msat.map(Some),
-					fee_paid_msat: Some(fee_paid_msat),
-					status: Some(PaymentStatus::Succeeded),
-					..PaymentDetailsUpdate::new(payment_id)
-				};
+				let update = payment_sent_update(
+					payment_id,
+					payment_hash,
+					payment_preimage,
+					amount_msat,
+					fee_paid_msat,
+				);
 
 				match self.payment_store.update(update).await {
 					Ok(_) => {},
@@ -2266,8 +2280,10 @@ mod tests {
 	use std::time::Duration;
 
 	use lightning::util::test_utils::TestLogger;
+	use lightning_types::payment::PaymentSecret;
 
 	use super::*;
+	use crate::data_store::StorableObject;
 	use crate::io::test_utils::InMemoryStore;
 	use crate::payment::store::LSPS2Parameters;
 	use crate::types::DynStoreWrapper;
@@ -2333,6 +2349,114 @@ mod tests {
 			incoming_payment_cancelled_event(offer_id, payer_signing_pubkey),
 			Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey }
 		);
+	}
+
+	#[test]
+	fn payment_sent_amount_updates_and_preserves_payment_details() {
+		let payment_id = PaymentId([1u8; 32]);
+		let payment_hash = PaymentHash([2u8; 32]);
+		let payment_preimage = PaymentPreimage([3u8; 32]);
+		let payment_secret = PaymentSecret([4u8; 32]);
+		let bolt11_kind = PaymentKind::Bolt11 {
+			hash: payment_hash,
+			preimage: None,
+			secret: Some(payment_secret),
+			counterparty_skimmed_fee_msat: None,
+		};
+
+		let mut with_event_amount = PaymentDetails::new(
+			payment_id,
+			bolt11_kind.clone(),
+			Some(5_000),
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		assert!(with_event_amount.update(payment_sent_update(
+			payment_id,
+			payment_hash,
+			payment_preimage,
+			Some(7_000),
+			Some(11),
+		)));
+		assert_eq!(with_event_amount.amount_msat, Some(7_000));
+		assert_eq!(with_event_amount.fee_paid_msat, Some(11));
+		assert_eq!(with_event_amount.status, PaymentStatus::Succeeded);
+		assert_eq!(
+			with_event_amount.kind,
+			PaymentKind::Bolt11 {
+				hash: payment_hash,
+				preimage: Some(payment_preimage),
+				secret: Some(payment_secret),
+				counterparty_skimmed_fee_msat: None,
+			}
+		);
+
+		let mut without_event_amount = PaymentDetails::new(
+			payment_id,
+			with_event_amount.kind.clone(),
+			Some(5_000),
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		without_event_amount.update(payment_sent_update(
+			payment_id,
+			payment_hash,
+			payment_preimage,
+			None,
+			None,
+		));
+		assert_eq!(without_event_amount.amount_msat, Some(5_000));
+		assert_eq!(without_event_amount.fee_paid_msat, None);
+		assert_eq!(without_event_amount.status, PaymentStatus::Succeeded);
+	}
+
+	#[test]
+	fn variable_amount_bolt12_payment_replays_with_event_amount() {
+		let payment_id = PaymentId([5u8; 32]);
+		let payment_hash = PaymentHash([6u8; 32]);
+		let payment_preimage = PaymentPreimage([7u8; 32]);
+		let payment = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Bolt12Offer {
+				hash: None,
+				preimage: None,
+				secret: None,
+				offer_id: OfferId([8u8; 32]),
+				payer_note: None,
+				quantity: Some(2),
+			},
+			None,
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		let mut updated = payment.clone();
+		updated.update(payment_sent_update(
+			payment_id,
+			payment_hash,
+			payment_preimage,
+			Some(4_200),
+			Some(9),
+		));
+
+		assert_eq!(updated.amount_msat, Some(4_200));
+		assert_eq!(updated.status, PaymentStatus::Succeeded);
+		assert_eq!(
+			updated.kind,
+			PaymentKind::Bolt12Offer {
+				hash: Some(payment_hash),
+				preimage: Some(payment_preimage),
+				secret: None,
+				offer_id: OfferId([8u8; 32]),
+				payer_note: None,
+				quantity: Some(2),
+			}
+		);
+
+		let replayed = PaymentDetails::read(&mut &updated.encode()[..]).unwrap();
+		assert_eq!(replayed, updated);
 	}
 
 	#[tokio::test]
