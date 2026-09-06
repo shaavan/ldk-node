@@ -35,8 +35,8 @@ use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::recurrence::RecurrenceManager;
 use crate::payment::recurrence::{
-	RecurrenceAttempt, RecurrenceCancellationState, RecurrenceDetails, RecurrenceId,
-	RecurrenceRetryState, RecurrenceStatus,
+	RecurrenceAttempt, RecurrenceCancellationState, RecurrenceConfig, RecurrenceDetails,
+	RecurrenceId, RecurrencePaymentWindow, RecurrenceRetryState, RecurrenceStatus,
 };
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use crate::runtime::Runtime;
@@ -174,6 +174,112 @@ pub struct Bolt12Payment {
 }
 
 impl Bolt12Payment {
+	/// Starts a recurrence using the supplied durable configuration. The primary invoice request
+	/// is submitted immediately; the returned identifiers distinguish the relationship from its
+	/// first payment attempt.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn start_recurrence(
+		&self, offer: &Offer, config: RecurrenceConfig,
+	) -> Result<(RecurrenceId, PaymentId), Error> {
+		let result = self.initiate_recurrence(
+			offer,
+			config.amount_msat,
+			config.maximum_amount_msat,
+			config.quantity,
+			config.payer_note,
+			config.routing_override,
+			config.initial_start,
+		)?;
+		let mut details = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&result.0))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::PersistenceFailed)?;
+		details.pay_next_automatically = config.pay_next_automatically;
+		details.recurrence_retry_policy = Some(config.retry_policy);
+		details.transition_id += 1;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details))
+			.map_err(|_| Error::PersistenceFailed)?;
+		Ok(result)
+	}
+
+	#[cfg(not(feature = "uniffi"))]
+	/// Returns the durable details for a recurrence.
+	pub fn recurrence(&self, recurrence_id: RecurrenceId) -> Result<RecurrenceDetails, Error> {
+		self.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::InvalidOfferId)
+	}
+
+	#[cfg(not(feature = "uniffi"))]
+	/// Lists all durable recurrence records.
+	pub fn list_recurrences(&self) -> Vec<RecurrenceDetails> {
+		self.runtime.block_on(self.recurrence_manager.list())
+	}
+
+	#[cfg(not(feature = "uniffi"))]
+	/// Returns the payment window for a period of an explicit-basetime offer.
+	pub fn recurrence_payment_window(
+		&self, offer: &Offer, period_index: u32,
+	) -> Result<RecurrencePaymentWindow, Error> {
+		let offer = maybe_deref(offer);
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+		let basetime = match recurrence.recurrence_type {
+			RecurrenceType::Compulsory(Some(base)) => base.basetime,
+			_ => return Err(Error::InvalidOffer),
+		};
+		let (opens_at, closes_at) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		Ok(RecurrencePaymentWindow {
+			period_index,
+			opens_at,
+			closes_at,
+			currently_payable: now >= opens_at && now < closes_at,
+		})
+	}
+
+	/// Returns the next payment window for an existing recurrence.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn next_recurrence_payment_window(
+		&self, recurrence_id: RecurrenceId,
+	) -> Result<RecurrencePaymentWindow, Error> {
+		let details = self.recurrence(recurrence_id)?;
+		let basetime = details.basetime.ok_or(Error::InvalidOffer)?;
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+		let period_index = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+		let (opens_at, closes_at) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		Ok(RecurrencePaymentWindow {
+			period_index,
+			opens_at,
+			closes_at,
+			currently_payable: now >= opens_at && now < closes_at,
+		})
+	}
+
+	/// Removes a completed recurrence without removing its ordinary payment history.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn remove_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		let details = self.recurrence(recurrence_id)?;
+		if !matches!(
+			details.status,
+			RecurrenceStatus::Cancelled
+				| RecurrenceStatus::Completed
+				| RecurrenceStatus::Missed
+				| RecurrenceStatus::RequiresAttention
+		) {
+			return Err(Error::InvalidOffer);
+		}
+		self.runtime
+			.block_on(self.recurrence_manager.remove(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)
+	}
 	pub(crate) fn new(
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
 		keys_manager: Arc<KeysManager>, payment_store: Arc<PaymentStore>,
@@ -438,6 +544,7 @@ impl Bolt12Payment {
 		Ok(payment_id)
 	}
 
+	/// Persists whether future recurrence periods should be submitted automatically.
 	pub(crate) fn set_pay_next_automatically(
 		&self, recurrence_id: RecurrenceId, enabled: bool,
 	) -> Result<(), Error> {
@@ -454,6 +561,7 @@ impl Bolt12Payment {
 		Ok(())
 	}
 
+	/// Persists a per-recurrence routing override; `None` restores node defaults.
 	pub(crate) fn set_recurrence_route_parameters(
 		&self, recurrence_id: RecurrenceId, route_parameters: Option<RouteParametersConfig>,
 	) -> Result<(), Error> {

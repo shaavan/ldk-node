@@ -62,7 +62,7 @@ impl StorableObjectId for RecurrenceId {
 
 /// The lifecycle status of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceStatus {
+pub enum RecurrenceStatus {
 	/// Recurrence can accept its next payment attempt.
 	Active,
 	/// Cancellation was requested and is being propagated.
@@ -88,7 +88,7 @@ impl_ser_tlv_based_enum!(RecurrenceStatus,
 
 /// The state of a recurring payment's retry schedule.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecurrenceRetryState {
+pub struct RecurrenceRetryState {
 	/// Number of failed attempts in the current payment window.
 	pub attempts: u32,
 	/// Unix timestamp at which another attempt may be made, if any.
@@ -101,7 +101,8 @@ impl_ser_tlv_based!(RecurrenceRetryState, {
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecurrenceRetryPolicy {
+pub struct RecurrenceRetryPolicy {
+	/// Maximum number of recurrence-level retries for one payment window.
 	pub max_retries: u32,
 }
 
@@ -115,13 +116,14 @@ impl_ser_tlv_based!(RecurrenceRetryPolicy, {
 	(0, max_retries, required),
 });
 
+/// Returns the bounded exponential delay used between recurrence-level retries.
 pub(crate) fn recurrence_retry_delay(attempt: u32) -> u64 {
 	5u64.saturating_mul(1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX)).min(300)
 }
 
 /// The lifecycle state of a payment attempt for a recurring offer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceAttempt {
+pub enum RecurrenceAttempt {
 	/// Payment identifier was persisted before submission was attempted.
 	Prepared { payment_id: PaymentId, amount_msat: u64 },
 	/// Payment submission was handed to LDK and awaits its terminal event.
@@ -141,7 +143,7 @@ impl_ser_tlv_based_enum!(RecurrenceAttempt,
 
 /// The cancellation state of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceCancellationState {
+pub enum RecurrenceCancellationState {
 	/// No cancellation request has been made.
 	NotRequested,
 	/// Local cancellation is recorded while the payee notification is in flight.
@@ -157,7 +159,7 @@ impl_ser_tlv_based_enum!(RecurrenceCancellationState,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceFailure {
+pub enum RecurrenceFailure {
 	/// Payment or invoice request expired before completion.
 	Expired,
 	/// Payee rejected the payment or invoice request.
@@ -180,7 +182,7 @@ impl_ser_tlv_based_enum!(RecurrenceFailure,
 
 /// Persisted state for one recurring offer.
 #[derive(Clone, Debug)]
-pub(crate) struct RecurrenceState {
+pub struct RecurrenceState {
 	/// Stable identifier for the recurring offer.
 	pub id: RecurrenceId,
 	/// Serialized offer retained so later payments use the original recurrence terms.
@@ -197,9 +199,9 @@ pub(crate) struct RecurrenceState {
 	pub routing_override: Option<RouteParametersConfig>,
 	/// LDK retry strategy for one payment attempt.
 	pub retry_policy: Retry,
-	/// Recurrence-level retry state across payment attempts.
 	/// Maximum number of recurrence-level retries for one payment window.
 	pub recurrence_retry_policy: Option<RecurrenceRetryPolicy>,
+	/// Recurrence-level retry state across payment attempts.
 	pub retry_state: RecurrenceRetryState,
 	/// Whether the node should submit future periods automatically.
 	pub pay_next_automatically: bool,
@@ -217,15 +219,63 @@ pub(crate) struct RecurrenceState {
 	pub attempt: Option<RecurrenceAttempt>,
 	/// Durable cancellation phase associated with [`Self::status`].
 	pub cancellation: RecurrenceCancellationState,
-	/// Monotonic identifier for externally observable state transitions.
 	/// Most recent failure classification for the current payment window.
 	pub failure: Option<RecurrenceFailure>,
+	/// Monotonic identifier for externally observable state transitions.
 	pub transition_id: u64,
 	/// Current lifecycle status.
 	pub status: RecurrenceStatus,
 }
 
-pub(crate) type RecurrenceDetails = RecurrenceState;
+pub type RecurrenceDetails = RecurrenceState;
+
+#[derive(Clone, Debug)]
+/// Configuration used when starting a recurring payment.
+pub struct RecurrenceConfig {
+	/// Requested amount, falling back to the offer amount when omitted.
+	pub amount_msat: Option<u64>,
+	/// Maximum amount accepted for each payment attempt.
+	pub maximum_amount_msat: Option<u64>,
+	/// Quantity included in each invoice request, if any.
+	pub quantity: Option<u64>,
+	/// Note sent to the payee with invoice requests.
+	pub payer_note: Option<String>,
+	/// Routing policy override; `None` uses the node-wide policy.
+	pub routing_override: Option<RouteParametersConfig>,
+	/// Period index from which the recurrence starts, if required by the offer.
+	pub initial_start: Option<u32>,
+	/// Whether future periods should be submitted automatically.
+	pub pay_next_automatically: bool,
+	/// Maximum number of retries within one future payment window.
+	pub retry_policy: RecurrenceRetryPolicy,
+}
+
+impl Default for RecurrenceConfig {
+	fn default() -> Self {
+		Self {
+			amount_msat: None,
+			maximum_amount_msat: None,
+			quantity: None,
+			payer_note: None,
+			routing_override: None,
+			initial_start: None,
+			pay_next_automatically: false,
+			retry_policy: RecurrenceRetryPolicy::default(),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecurrencePaymentWindow {
+	/// Period represented by this window.
+	pub period_index: u32,
+	/// Unix timestamp when the window opens.
+	pub opens_at: u64,
+	/// Unix timestamp when the window closes.
+	pub closes_at: u64,
+	/// Whether the current wall-clock time is inside the window.
+	pub currently_payable: bool,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecurrenceDetailsUpdate {
