@@ -502,10 +502,16 @@ impl Readable for RecurrenceState {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use lightning::routing::router::RouteParametersConfig;
 	use lightning::util::ser::{Readable, Writeable};
 
 	use super::*;
+	use crate::data_store::DataStore;
+	use crate::io::test_utils::InMemoryStore;
+	use crate::logger::Logger;
+	use crate::types::{DynStore, DynStoreWrapper};
 
 	fn state(opaque_state: Option<Vec<u8>>) -> RecurrenceState {
 		RecurrenceState {
@@ -537,6 +543,20 @@ mod tests {
 			transition_id: 24,
 			status: RecurrenceStatus::RequiresAttention,
 		}
+	}
+
+	fn manager(details: Vec<RecurrenceDetails>) -> (RecurrenceManager, Arc<RecurrenceStore>) {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let recurrence_store = Arc::new(DataStore::new(
+			details,
+			crate::data_store::KeepAllEntries,
+			crate::io::RECURRENCE_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			crate::io::RECURRENCE_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		));
+		(RecurrenceManager::new(Arc::clone(&recurrence_store)), recurrence_store)
 	}
 
 	fn assert_state_fields(actual: &RecurrenceState, expected: &RecurrenceState) {
@@ -664,5 +684,71 @@ mod tests {
 		for length in 0..encoded.len() {
 			assert!(RecurrenceState::read(&mut &encoded[..length]).is_err());
 		}
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_supports_crud_and_cache_miss_fallback() {
+		let mut expected = state(None);
+		expected.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([30; 32]), amount_msat: 31 });
+		let (manager, store) = manager(Vec::new());
+
+		manager.insert(expected.clone()).await.unwrap();
+		assert_eq!(manager.get(&expected.id).await.unwrap().unwrap().id, expected.id);
+		assert_eq!(manager.list().await.len(), 1);
+		assert_eq!(
+			manager.by_payment_id(&PaymentId([30; 32])).await.unwrap().map(|v| v.id),
+			Some(expected.id)
+		);
+
+		expected.paid_count += 1;
+		manager.update(expected.clone()).await.unwrap();
+		assert_eq!(manager.get(&expected.id).await.unwrap().unwrap().paid_count, 20);
+
+		manager.payment_index.lock().expect("lock").clear();
+		assert_eq!(
+			manager.by_payment_id(&PaymentId([30; 32])).await.unwrap().map(|v| v.id),
+			Some(expected.id)
+		);
+
+		store.remove(&expected.id).await.unwrap();
+		assert!(manager.get(&expected.id).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_reconstructs_index_after_restart() {
+		let expected = state(None);
+		let (first, store) = manager(Vec::new());
+		first.insert(expected.clone()).await.unwrap();
+
+		let restarted = RecurrenceManager::new(store);
+		restarted.rebuild_index().await;
+		assert_eq!(restarted.get(&expected.id).await.unwrap().map(|v| v.id), Some(expected.id));
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_claims_only_one_concurrent_attempt() {
+		let mut expected = state(None);
+		expected.status = RecurrenceStatus::Active;
+		expected.cancellation = RecurrenceCancellationState::NotRequested;
+		expected.attempt = None;
+		expected.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+		let (manager, _) = manager(vec![expected.clone()]);
+		let first_attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([30; 32]), amount_msat: 31 };
+		let second_attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([32; 32]), amount_msat: 33 };
+
+		let (first, second) = tokio::join!(
+			manager.claim_attempt(&expected.id, first_attempt),
+			manager.claim_attempt(&expected.id, second_attempt)
+		);
+		assert_eq!(
+			first.as_ref().unwrap().is_some() as u8 + second.as_ref().unwrap().is_some() as u8,
+			1
+		);
+		let claimed = manager.get(&expected.id).await.unwrap().unwrap();
+		assert!(matches!(claimed.attempt, Some(RecurrenceAttempt::Prepared { .. })));
+		assert_eq!(claimed.transition_id, expected.transition_id + 1);
 	}
 }
