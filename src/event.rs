@@ -1414,6 +1414,7 @@ where
 				payment_id,
 				payment_preimage,
 				payment_hash,
+				amount_msat,
 				fee_paid_msat,
 				bolt12_invoice,
 				..
@@ -1428,6 +1429,7 @@ where
 				let update = PaymentDetailsUpdate {
 					hash: Some(Some(payment_hash)),
 					preimage: Some(Some(payment_preimage)),
+					amount_msat: amount_msat.map(Some),
 					fee_paid_msat: Some(fee_paid_msat),
 					status: Some(PaymentStatus::Succeeded),
 					..PaymentDetailsUpdate::new(payment_id)
@@ -1443,20 +1445,25 @@ where
 
 				match self.payment_store.get(&payment_id).await {
 					Ok(Some(payment)) => {
-						let amount_msat = payment.amount_msat.expect(
-							"outbound payments should record their amount before they can succeed",
-						);
-						log_info!(
-							self.logger,
-							"Successfully sent payment of {}msat{} with payment hash {}",
-							amount_msat,
-							if let Some(fee) = fee_paid_msat {
-								format!(" (fee {} msat)", fee)
-							} else {
-								"".to_string()
-							},
-							hex_utils::to_string(&payment_hash.0),
-						);
+						if let Some(amount_msat) = payment.amount_msat {
+							log_info!(
+								self.logger,
+								"Successfully sent payment of {}msat{} with payment hash {}",
+								amount_msat,
+								if let Some(fee) = fee_paid_msat {
+									format!(" (fee {} msat)", fee)
+								} else {
+									"".to_string()
+								},
+								hex_utils::to_string(&payment_hash.0),
+							);
+						} else {
+							log_info!(
+								self.logger,
+								"Successfully sent payment with payment hash {} (amount unavailable)",
+								hex_utils::to_string(&payment_hash.0),
+							);
+						}
 					},
 					Ok(None) => {},
 					Err(e) => {
