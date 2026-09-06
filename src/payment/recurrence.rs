@@ -6,9 +6,10 @@
 // accordance with one or both of these licenses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
 use lightning::offers::offer::OfferId;
@@ -252,11 +253,16 @@ pub(crate) fn record_failure(
 pub(crate) struct RecurrenceManager {
 	store: Arc<RecurrenceStore>,
 	payment_index: Mutex<HashMap<PaymentId, RecurrenceId>>,
+	recovery_complete: AtomicBool,
 }
 
 impl RecurrenceManager {
 	pub(crate) fn new(store: Arc<RecurrenceStore>) -> Self {
-		Self { store, payment_index: Mutex::new(HashMap::new()) }
+		Self {
+			store,
+			payment_index: Mutex::new(HashMap::new()),
+			recovery_complete: AtomicBool::new(false),
+		}
 	}
 
 	pub(crate) fn store(&self) -> &Arc<RecurrenceStore> {
@@ -279,6 +285,43 @@ impl RecurrenceManager {
 				index.insert(payment_id, details.id);
 			}
 		}
+	}
+
+	pub(crate) async fn reconcile_attempts(
+		&self, recent_payments: &[RecentPaymentDetails],
+	) -> Result<Vec<RecurrenceDetails>, crate::Error> {
+		let recent: HashMap<PaymentId, &RecentPaymentDetails> = recent_payments
+			.iter()
+			.filter_map(|payment| {
+				let id = match payment {
+					RecentPaymentDetails::AwaitingInvoice { payment_id }
+					| RecentPaymentDetails::Pending { payment_id, .. }
+					| RecentPaymentDetails::Abandoned { payment_id, .. }
+					| RecentPaymentDetails::Fulfilled { payment_id, .. } => *payment_id,
+				};
+				Some((id, payment))
+			})
+			.collect();
+		let mut retry = Vec::new();
+		for mut details in self.list().await {
+			let Some(RecurrenceAttempt::Prepared { payment_id, amount_msat }) = details.attempt
+			else {
+				continue;
+			};
+			if recent.contains_key(&payment_id) {
+				details.attempt = Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+				details.transition_id += 1;
+				self.update(details).await?;
+			} else {
+				retry.push(details);
+			}
+		}
+		self.recovery_complete.store(true, Ordering::Release);
+		Ok(retry)
+	}
+
+	pub(crate) fn is_recovery_complete(&self) -> bool {
+		self.recovery_complete.load(Ordering::Acquire)
 	}
 
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
