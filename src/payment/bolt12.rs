@@ -32,9 +32,10 @@ use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
+use crate::payment::recurrence::RecurrenceStore;
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, KeysManager, PaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore, RecurrenceStore};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt12Invoice = lightning::offers::invoice::Bolt12Invoice;
@@ -98,6 +99,7 @@ pub struct Bolt12Payment {
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
 	payment_store: Arc<PaymentStore>,
+	recurrence_store: Arc<RecurrenceStore>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
 	logger: Arc<Logger>,
@@ -107,7 +109,8 @@ pub struct Bolt12Payment {
 impl Bolt12Payment {
 	pub(crate) fn new(
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
-		keys_manager: Arc<KeysManager>, payment_store: Arc<PaymentStore>, config: Arc<Config>,
+		keys_manager: Arc<KeysManager>, payment_store: Arc<PaymentStore>,
+		recurrence_store: Arc<RecurrenceStore>, config: Arc<Config>,
 		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
 		async_payments_role: Option<AsyncPaymentsRole>,
 	) -> Self {
@@ -116,6 +119,7 @@ impl Bolt12Payment {
 			channel_manager,
 			keys_manager,
 			payment_store,
+			recurrence_store,
 			config,
 			is_running,
 			logger,

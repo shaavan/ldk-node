@@ -5,6 +5,9 @@
 // http://opensource.org/licenses/MIT>. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::outbound_payment::Retry;
 pub(crate) use lightning::offers::invoice_request::RecurrenceId;
@@ -12,8 +15,9 @@ use lightning::routing::router::RouteParametersConfig;
 use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_types::string::UntrustedString;
 
-use crate::data_store::StorableObjectId;
+use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
+use crate::types::RecurrenceStore;
 
 impl StorableObjectId for RecurrenceId {
 	fn encode_to_hex_str(&self) -> String {
@@ -49,7 +53,10 @@ impl_ser_tlv_based_enum!(RecurrenceStatus,
 ///
 /// Stored using [`RecurrenceId`] as the key.
 #[derive(Clone, Debug)]
-pub(crate) struct OutboundRecurrenceState {
+pub(crate) struct RecurrenceDetails {
+	/// Recurrence ID
+	pub id: RecurrenceId,
+
 	/// Current lifecycle status of the recurrence.
 	pub status: RecurrenceStatus,
 
@@ -98,9 +105,10 @@ pub(crate) struct OutboundRecurrenceState {
 	pub pay_next_automatically: bool,
 }
 
-impl Default for OutboundRecurrenceState {
+impl Default for RecurrenceDetails {
 	fn default() -> Self {
 		Self {
+			id: RecurrenceId([0; 32]),
 			status: RecurrenceStatus::Active,
 			original_offer: Vec::new(),
 			amount_msat: None,
@@ -118,21 +126,55 @@ impl Default for OutboundRecurrenceState {
 	}
 }
 
-impl_ser_tlv_based!(OutboundRecurrenceState, {
-	(0, status, required),
-	(2, original_offer, required),
-	(4, amount_msat, option),
-	(6, quantity, option),
-	(8, payer_note, option),
-	(10, basetime, required),
-	(12, initial_start, option),
-	(14, paid_count, required),
-	(16, opaque_state, option),
-	(18, retry_policy, required),
-	(20, routing_override, option),
-	(22, last_successful_payment_id, option),
-	(24, pay_next_automatically, required),
+impl_ser_tlv_based!(RecurrenceDetails, {
+	(0, id, required),
+	(2, status, required),
+	(4, original_offer, required),
+	(6, amount_msat, option),
+	(8, quantity, option),
+	(10, payer_note, option),
+	(12, basetime, required),
+	(14, initial_start, option),
+	(16, paid_count, required),
+	(18, opaque_state, option),
+	(20, retry_policy, required),
+	(22, routing_override, option),
+	(24, last_successful_payment_id, option),
+	(26, pay_next_automatically, required),
 });
+
+impl StorableObject for RecurrenceDetails {
+	type Id = RecurrenceId;
+	type Update = RecurrenceDetailsUpdate;
+
+	fn id(&self) -> Self::Id {
+		self.id
+	}
+
+	fn update(&mut self, update: Self::Update) -> bool {
+		if self.id() != update.details.id() {
+			return false;
+		}
+		*self = update.details;
+		true
+	}
+
+	fn to_update(&self) -> Self::Update {
+		RecurrenceDetailsUpdate { details: self.clone() }
+	}
+}
+
+/// Update instructions for a RecurrenceDetails
+#[derive(Clone, Debug)]
+pub(crate) struct RecurrenceDetailsUpdate {
+	pub details: RecurrenceDetails,
+}
+
+impl StorableObjectUpdate<RecurrenceDetails> for RecurrenceDetailsUpdate {
+	fn id(&self) -> RecurrenceId {
+		self.details.id
+	}
+}
 
 #[cfg(test)]
 mod tests {
@@ -142,7 +184,8 @@ mod tests {
 
 	#[test]
 	fn outbound_recurrence_state_roundtrip() {
-		let state = OutboundRecurrenceState {
+		let state = RecurrenceDetails {
+			id: RecurrenceId([2; 32]),
 			status: RecurrenceStatus::Completed,
 			original_offer: vec![1, 2, 3],
 			amount_msat: Some(21_000),
@@ -165,7 +208,7 @@ mod tests {
 		};
 
 		let encoded = state.encode();
-		let decoded = OutboundRecurrenceState::read(&mut &*encoded).unwrap();
+		let decoded = RecurrenceDetails::read(&mut &*encoded).unwrap();
 
 		assert_eq!(decoded.status, state.status);
 		assert_eq!(decoded.original_offer, state.original_offer);
