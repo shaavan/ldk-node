@@ -6,9 +6,10 @@
 // accordance with one or both of these licenses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
 pub(crate) use lightning::offers::invoice_request::RecurrenceId;
@@ -20,7 +21,9 @@ use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_types::string::UntrustedString;
 
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
+use crate::event::{Event, EventQueue};
 use crate::hex_utils;
+use crate::logger::Logger;
 use crate::types::RecurrenceStore;
 
 impl StorableObjectId for RecurrenceId {
@@ -264,12 +267,17 @@ pub(crate) fn record_failure(
 pub(crate) struct RecurrenceManager {
 	store: Arc<RecurrenceStore>,
 	payment_index: Mutex<HashMap<PaymentId, RecurrenceId>>,
+	recovery_complete: AtomicBool,
 }
 
 impl RecurrenceManager {
 	/// Creates a manager backed by the durable recurrence store.
 	pub(crate) fn new(store: Arc<RecurrenceStore>) -> Self {
-		Self { store, payment_index: Mutex::new(HashMap::new()) }
+		Self {
+			store,
+			payment_index: Mutex::new(HashMap::new()),
+			recovery_complete: AtomicBool::new(false),
+		}
 	}
 
 	/// Returns the store used for durable recurrence records.
@@ -294,6 +302,90 @@ impl RecurrenceManager {
 				index.insert(payment_id, details.id);
 			}
 		}
+	}
+
+	/// Reconciles durable attempts with LDK's recent-payment history after restart.
+	///
+	/// Prepared attempts are returned for resubmission when LDK has no matching payment, while
+	/// pending and fulfilled attempts are promoted without creating duplicate payments.
+	pub(crate) async fn reconcile_attempts(
+		&self, recent_payments: &[RecentPaymentDetails],
+		event_queue: Option<&EventQueue<Arc<Logger>>>,
+	) -> Result<Vec<RecurrenceDetails>, crate::Error> {
+		let recent: HashMap<PaymentId, &RecentPaymentDetails> = recent_payments
+			.iter()
+			.filter_map(|payment| {
+				let id = match payment {
+					RecentPaymentDetails::AwaitingInvoice { payment_id }
+					| RecentPaymentDetails::Pending { payment_id, .. }
+					| RecentPaymentDetails::Abandoned { payment_id, .. }
+					| RecentPaymentDetails::Fulfilled { payment_id, .. } => *payment_id,
+				};
+				Some((id, payment))
+			})
+			.collect();
+		let mut retry = Vec::new();
+		for mut details in self.list().await {
+			let Some(attempt) = details.attempt.clone() else {
+				continue;
+			};
+			let (payment_id, amount_msat, prepared) = match attempt {
+				RecurrenceAttempt::Prepared { payment_id, amount_msat } => {
+					(payment_id, amount_msat, true)
+				},
+				RecurrenceAttempt::Submitted { payment_id, amount_msat } => {
+					(payment_id, amount_msat, false)
+				},
+			};
+			match recent.get(&payment_id) {
+				Some(RecentPaymentDetails::Fulfilled { .. }) => {
+					let previous_status = details.status;
+					details.last_successful_payment_id = Some(payment_id);
+					details.attempt = None;
+					details.failure = None;
+					details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+					// Recent-payment records do not retain invoice recurrence metadata. Without it,
+					// advancing an implicit-basetime schedule or enforcing its limit is unsafe.
+					details.status = RecurrenceStatus::RequiresAttention;
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details.clone()).await?;
+					if previous_status != details.status {
+						if let Some(event_queue) = event_queue {
+							event_queue
+								.add_event(Event::RecurrenceStatusChanged {
+									recurrence_id: details.id.0.to_vec(),
+									status: details.status.discriminant(),
+									transition_id: details.transition_id,
+								})
+								.await?;
+						}
+					}
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) if prepared => {
+					details.attempt =
+						Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details).await?;
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) => {},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None if prepared => {
+					retry.push(details)
+				},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None => {},
+			}
+		}
+		self.recovery_complete.store(true, Ordering::Release);
+		Ok(retry)
+	}
+
+	pub(crate) fn is_recovery_complete(&self) -> bool {
+		self.recovery_complete.load(Ordering::Acquire)
 	}
 
 	/// Persists a new recurrence and indexes its known payment identifiers.
@@ -893,6 +985,67 @@ mod tests {
 			tokio::join!(manager.insert(expected.clone()), manager.insert(expected.clone()));
 		assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
 		assert_eq!(manager.list().await.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn recovery_promotes_known_attempts_and_retains_unknown_prepared() {
+		let mut known = state(None);
+		known.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([70; 32]), amount_msat: 71 });
+		let mut absent = state(None);
+		absent.id = RecurrenceId([72; 32]);
+		absent.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([73; 32]), amount_msat: 74 });
+		let (manager, _) = manager(vec![known.clone(), absent.clone()]);
+		let retry = manager
+			.reconcile_attempts(
+				&[RecentPaymentDetails::AwaitingInvoice { payment_id: PaymentId([70; 32]) }],
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(retry.len(), 1);
+		assert_eq!(retry[0].id, absent.id);
+		assert!(matches!(
+			manager.get(&known.id).await.unwrap().unwrap().attempt,
+			Some(RecurrenceAttempt::Submitted { payment_id, .. }) if payment_id == PaymentId([70; 32])
+		));
+		assert!(manager.is_recovery_complete());
+	}
+
+	#[tokio::test]
+	async fn recovery_treats_fulfilled_attempt_as_authoritative_success() {
+		let mut details = state(None);
+		details.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([80; 32]), amount_msat: 81 });
+		let (manager, _) = manager(vec![details.clone()]);
+		let event_store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let event_queue = EventQueue::new(event_store, logger);
+		let retry = manager
+			.reconcile_attempts(
+				&[RecentPaymentDetails::Fulfilled {
+					payment_id: PaymentId([80; 32]),
+					payment_hash: None,
+					fee_paid_msat: None,
+				}],
+				Some(&event_queue),
+			)
+			.await
+			.unwrap();
+		assert!(retry.is_empty());
+		let recovered = manager.get(&details.id).await.unwrap().unwrap();
+		assert_eq!(recovered.last_successful_payment_id, Some(PaymentId([80; 32])));
+		assert_eq!(recovered.status, RecurrenceStatus::RequiresAttention);
+		assert_eq!(recovered.paid_count, details.paid_count);
+		assert!(recovered.attempt.is_none());
+		assert!(matches!(
+			event_queue.next_event(),
+			Some(Event::RecurrenceStatusChanged { recurrence_id, status, transition_id })
+				if recurrence_id == details.id.0.to_vec()
+					&& status == RecurrenceStatus::RequiresAttention.discriminant()
+					&& transition_id == recovered.transition_id
+		));
 	}
 
 	#[test]
