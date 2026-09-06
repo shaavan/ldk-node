@@ -1262,6 +1262,39 @@ mod tests {
 	}
 
 	#[test]
+	fn recurrence_config_defaults_to_manual_payment_and_three_retries() {
+		let config = RecurrenceConfig::default();
+		assert!(!config.pay_next_automatically);
+		assert_eq!(config.retry_policy, RecurrenceRetryPolicy { max_retries: 3 });
+		assert!(config.amount_msat.is_none());
+		assert!(config.maximum_amount_msat.is_none());
+		assert!(config.quantity.is_none());
+		assert!(config.payer_note.is_none());
+		assert!(config.routing_override.is_none());
+		assert!(config.initial_start.is_none());
+	}
+
+	#[test]
+	fn recurrence_manager_removes_record_and_index_entries() {
+		let expected = state(None);
+		let (manager, _) = manager(Vec::new());
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		runtime.block_on(manager.insert(expected.clone())).unwrap();
+		assert_eq!(runtime.block_on(manager.list()).len(), 1);
+		assert!(runtime
+			.block_on(manager.by_payment_id(&expected.last_successful_payment_id.unwrap()))
+			.unwrap()
+			.is_some());
+
+		runtime.block_on(manager.remove(&expected.id)).unwrap();
+		assert!(runtime.block_on(manager.get(&expected.id)).unwrap().is_none());
+		assert!(runtime
+			.block_on(manager.by_payment_id(&expected.last_successful_payment_id.unwrap()))
+			.unwrap()
+			.is_none());
+	}
+
+	#[test]
 	fn cancellation_state_is_terminal_and_late_success_does_not_resume() {
 		let mut details = state(Some(vec![9, 9]));
 		details.status = RecurrenceStatus::Cancelled;
