@@ -24,7 +24,16 @@ use crate::types::RecurrenceStore;
 
 /// A stable identifier for a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RecurrenceId(pub [u8; 32]);
+pub struct RecurrenceId(
+	/// The stable 32-byte identifier.
+	pub [u8; 32],
+);
+
+impl From<RecurrenceId> for lightning::offers::invoice_request::RecurrenceId {
+	fn from(id: RecurrenceId) -> Self {
+		Self(id.0)
+	}
+}
 
 impl Writeable for RecurrenceId {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
@@ -127,9 +136,9 @@ pub(crate) struct RecurrenceState {
 	pub retry_policy: Retry,
 	pub retry_state: RecurrenceRetryState,
 	pub pay_next_automatically: bool,
-	pub initial_start: u64,
+	pub initial_start: Option<u32>,
 	pub paid_count: u64,
-	pub basetime: u64,
+	pub basetime: Option<u64>,
 	pub opaque_state: Option<Vec<u8>>,
 	pub last_successful_payment_id: Option<PaymentId>,
 	pub attempt: Option<RecurrenceAttempt>,
@@ -206,6 +215,7 @@ impl RecurrenceManager {
 	}
 
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
+		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
 		self.store.insert(details.clone()).await?;
 		self.index(&details);
 		Ok(())
@@ -220,6 +230,7 @@ impl RecurrenceManager {
 	pub(crate) async fn update(
 		&self, details: RecurrenceDetails,
 	) -> Result<crate::data_store::DataStoreUpdateResult, crate::Error> {
+		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
 		let result = self.store.update(details.to_update()).await?;
 		self.index(&details);
 		Ok(result)
@@ -318,9 +329,9 @@ impl Default for RecurrenceState {
 			retry_policy: Retry::Attempts(0),
 			retry_state: RecurrenceRetryState { attempts: 0, next_retry_at: None },
 			pay_next_automatically: false,
-			initial_start: 0,
+			initial_start: None,
 			paid_count: 0,
-			basetime: 0,
+			basetime: None,
 			opaque_state: None,
 			last_successful_payment_id: None,
 			attempt: None,
@@ -342,7 +353,6 @@ impl RecurrenceState {
 				.maximum_amount_msat
 				.zip(self.amount_msat)
 				.is_some_and(|(maximum, amount)| amount > maximum)
-			|| self.basetime < self.initial_start
 			|| self.paid_count > self.transition_id
 		{
 			return Err(DecodeError::InvalidValue);
@@ -508,9 +518,9 @@ mod tests {
 			retry_policy: Retry::Attempts(15),
 			retry_state: RecurrenceRetryState { attempts: 16, next_retry_at: Some(17) },
 			pay_next_automatically: true,
-			initial_start: 18,
+			initial_start: Some(18),
 			paid_count: 19,
-			basetime: 20,
+			basetime: Some(20),
 			opaque_state,
 			last_successful_payment_id: Some(PaymentId([21; 32])),
 			attempt: Some(RecurrenceAttempt::Submitted {
