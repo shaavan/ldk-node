@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lightning::blinded_path::message::BlindedMessagePath;
 use lightning::ln::channelmanager::{OptionalOfferPaymentParams, PaymentId};
 use lightning::ln::outbound_payment::Retry;
-use lightning::offers::offer::{Amount, Offer as LdkOffer, OfferFromHrn, Quantity};
+use lightning::offers::offer::{Amount, Offer as LdkOffer, OfferFromHrn, Quantity, RecurrenceType};
 use lightning::offers::parse::Bolt12SemanticError;
 use lightning::offers::payer_proof::PaidBolt12Invoice as LdkPaidBolt12Invoice;
 #[cfg(not(feature = "uniffi"))]
@@ -24,7 +24,8 @@ use lightning::offers::payer_proof::PayerProof as LdkPayerProof;
 use lightning::routing::router::RouteParametersConfig;
 use lightning::sign::{EntropySource, NodeSigner};
 #[cfg(feature = "uniffi")]
-use lightning::util::ser::{Readable, Writeable};
+use lightning::util::ser::Readable;
+use lightning::util::ser::Writeable;
 use lightning_types::payment::PaymentPreimage;
 use lightning_types::string::UntrustedString;
 
@@ -33,6 +34,10 @@ use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::recurrence::RecurrenceManager;
+use crate::payment::recurrence::{
+	RecurrenceAttempt, RecurrenceCancellationState, RecurrenceDetails, RecurrenceId,
+	RecurrenceRetryState, RecurrenceStatus,
+};
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use crate::runtime::Runtime;
 use crate::types::{ChannelManager, KeysManager, PaymentStore};
@@ -125,6 +130,136 @@ impl Bolt12Payment {
 			logger,
 			async_payments_role,
 		}
+	}
+
+	/// Registers and submits the primary invoice request for a recurring offer.
+	///
+	/// The returned [`RecurrenceId`] identifies the complete recurring relationship and must be
+	/// retained for its lifetime. The returned [`PaymentId`] identifies only the initial payment
+	/// attempt. Both identifiers are generated after validation and persisted before submission.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn initiate_recurrence(
+		&self, offer: &Offer, amount_msat: Option<u64>, maximum_amount_msat: Option<u64>,
+		quantity: Option<u64>, payer_note: Option<String>,
+		route_parameters: Option<RouteParametersConfig>, initial_start: Option<u32>,
+	) -> Result<(RecurrenceId, PaymentId), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let offer = maybe_deref(offer);
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvoiceRequestCreationFailed)?;
+		if recurrence.period_index(0, initial_start).is_err() {
+			return Err(Error::InvoiceRequestCreationFailed);
+		}
+
+		let offer_amount_msat = match offer.amount() {
+			Some(Amount::Bitcoin { amount_msats }) => Some(amount_msats),
+			Some(_) => return Err(Error::UnsupportedCurrency),
+			None => None,
+		};
+		let amount_msat = amount_msat.or(offer_amount_msat);
+		if amount_msat.is_none() {
+			return Err(Error::InvalidAmount);
+		}
+		if let Some(maximum_amount_msat) = maximum_amount_msat {
+			if amount_msat.unwrap() > maximum_amount_msat {
+				return Err(Error::InvalidAmount);
+			}
+		}
+
+		let recurrence_id = RecurrenceId(self.keys_manager.get_secure_random_bytes());
+		let payment_id = PaymentId(self.keys_manager.get_secure_random_bytes());
+		let retry_policy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
+		let mut details = RecurrenceDetails {
+			id: recurrence_id,
+			original_offer: offer.encode(),
+			amount_msat,
+			maximum_amount_msat,
+			quantity,
+			payer_note: payer_note.clone().map(UntrustedString),
+			routing_override: route_parameters,
+			retry_policy,
+			retry_state: RecurrenceRetryState { attempts: 0, next_retry_at: None },
+			pay_next_automatically: false,
+			initial_start,
+			paid_count: 0,
+			basetime: match recurrence.recurrence_type {
+				RecurrenceType::Compulsory(Some(base)) => Some(base.basetime),
+				_ => None,
+			},
+			opaque_state: None,
+			last_successful_payment_id: None,
+			attempt: Some(RecurrenceAttempt::Prepared {
+				payment_id,
+				amount_msat: amount_msat.unwrap(),
+			}),
+			cancellation: RecurrenceCancellationState::NotRequested,
+			transition_id: 0,
+			status: RecurrenceStatus::Active,
+		};
+
+		if self.runtime.block_on(self.recurrence_manager.insert(details.clone())).is_err() {
+			return Err(Error::PersistenceFailed);
+		}
+		let kind = PaymentKind::Bolt12Offer {
+			hash: None,
+			preimage: None,
+			secret: None,
+			offer_id: offer.id(),
+			payer_note: details.payer_note.clone(),
+			quantity,
+		};
+		let payment = PaymentDetails::new(
+			payment_id,
+			kind,
+			amount_msat,
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			return Ok((recurrence_id, payment_id));
+		}
+
+		let params = lightning::ln::channelmanager::RecurrencePaymentParams {
+			counter: 0,
+			start: initial_start,
+			prev_state: None,
+			quantity,
+			expected_invoice_recurrence_basetime: details.basetime,
+		};
+		let optional_params = lightning::ln::channelmanager::OptionalOfferPaymentParams {
+			payer_note,
+			route_params_config: route_parameters.unwrap_or_default(),
+			retry_strategy: retry_policy,
+		};
+		if self
+			.channel_manager
+			.pay_for_recurrence(
+				&offer,
+				amount_msat,
+				payment_id,
+				recurrence_id.into(),
+				params,
+				optional_params,
+			)
+			.is_ok()
+		{
+			details.attempt = Some(RecurrenceAttempt::Submitted {
+				payment_id,
+				amount_msat: amount_msat.unwrap(),
+			});
+			details.transition_id += 1;
+		} else {
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+		}
+		let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+		Ok((recurrence_id, payment_id))
 	}
 
 	pub(crate) fn send_using_amount_inner(
