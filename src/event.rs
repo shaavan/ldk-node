@@ -2510,6 +2510,17 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn recurrence_status_event_round_trips_and_preserves_transition() {
+		let event = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![7; 32],
+			status: RecurrenceStatus::CancellationPending.discriminant(),
+			transition_id: 19,
+		};
+		let encoded = event.encode();
+		let decoded = Event::read(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded, event);
+	}
 	#[tokio::test]
 	/// Verify that an incoming cancellation event survives persistence and replay, and that
 	/// acknowledging the event removes it from the persisted queue.
