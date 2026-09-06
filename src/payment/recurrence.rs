@@ -328,6 +328,7 @@ impl RecurrenceManager {
 				let mut updated = current.clone();
 				updated.transition_id = updated.transition_id.checked_add(1)?;
 				updated.attempt = Some(attempt.clone());
+				updated.failure = None;
 				updated.validate().ok()?;
 				Some(updated)
 			})
