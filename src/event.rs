@@ -840,7 +840,8 @@ where
 			recurrence.payment_window(basetime, period).ok().map(|(_, closing)| closing)
 		});
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-		record_failure(&mut details, payment_id, failure, now, closing_time);
+		let retry_policy = details.recurrence_retry_policy.unwrap_or_default();
+		record_failure(&mut details, payment_id, failure, now, closing_time, retry_policy);
 		self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
 		Ok(())
 	}
