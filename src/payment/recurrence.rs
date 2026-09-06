@@ -123,6 +123,23 @@ impl_ser_tlv_based_enum!(RecurrenceCancellationState,
 	(4, Cancelled) => {},
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecurrenceFailure {
+	Expired,
+	Rejected,
+	RouteFailed,
+	Abandoned,
+	Unknown,
+}
+
+impl_ser_tlv_based_enum!(RecurrenceFailure,
+	(0, Expired) => {},
+	(2, Rejected) => {},
+	(4, RouteFailed) => {},
+	(6, Abandoned) => {},
+	(8, Unknown) => {},
+);
+
 /// Persisted state for one recurring offer.
 #[derive(Clone, Debug)]
 pub(crate) struct RecurrenceState {
@@ -143,38 +160,12 @@ pub(crate) struct RecurrenceState {
 	pub last_successful_payment_id: Option<PaymentId>,
 	pub attempt: Option<RecurrenceAttempt>,
 	pub cancellation: RecurrenceCancellationState,
+	pub failure: Option<RecurrenceFailure>,
 	pub transition_id: u64,
 	pub status: RecurrenceStatus,
 }
 
 pub(crate) type RecurrenceDetails = RecurrenceState;
-
-pub(crate) fn record_success(
-	details: &mut RecurrenceDetails, payment_id: PaymentId, basetime: u64,
-	next_state: Option<&[u8]>, period_index: u32, recurrence_limit: Option<u32>,
-) {
-	if matches!(
-		details.status,
-		RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
-	) {
-		return;
-	}
-	if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
-		return;
-	}
-	details.paid_count = details.paid_count.saturating_add(1);
-	details.basetime.get_or_insert(basetime);
-	details.opaque_state = next_state.map(|state| state.to_vec());
-	details.last_successful_payment_id = Some(payment_id);
-	details.attempt = None;
-	details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
-	details.transition_id += 1;
-	if details.status.eq(&RecurrenceStatus::Active)
-		&& recurrence_limit.map(|limit| period_index >= limit).unwrap_or(false)
-	{
-		details.status = RecurrenceStatus::Completed;
-	}
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecurrenceDetailsUpdate {
@@ -213,6 +204,12 @@ pub(crate) fn record_success(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, basetime: u64,
 	next_state: Option<&[u8]>, period_index: u32, recurrence_limit: Option<u32>,
 ) {
+	if matches!(
+		details.status,
+		RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+	) {
+		return;
+	}
 	if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
 		return;
 	}
@@ -227,6 +224,22 @@ pub(crate) fn record_success(
 		&& recurrence_limit.map(|limit| period_index >= limit).unwrap_or(false)
 	{
 		details.status = RecurrenceStatus::Completed;
+	}
+}
+
+/// Records failed attempt state without changing an already successful recurrence.
+pub(crate) fn record_failure(
+	details: &mut RecurrenceDetails, payment_id: PaymentId, failure: RecurrenceFailure, now: u64,
+	closing_time: Option<u64>,
+) {
+	if details.last_successful_payment_id == Some(payment_id) {
+		return;
+	}
+	details.attempt = None;
+	details.failure = Some(failure);
+	details.transition_id = details.transition_id.saturating_add(1);
+	if closing_time.map(|closing| now >= closing).unwrap_or(false) {
+		details.status = RecurrenceStatus::Missed;
 	}
 }
 
@@ -391,6 +404,7 @@ impl Default for RecurrenceState {
 			last_successful_payment_id: None,
 			attempt: None,
 			cancellation: RecurrenceCancellationState::NotRequested,
+			failure: None,
 			transition_id: 0,
 			status: RecurrenceStatus::Active,
 		}
@@ -480,6 +494,7 @@ impl Writeable for RecurrenceState {
 			(28, self.last_successful_payment_id, option),
 			(30, self.attempt, option),
 			(32, self.cancellation, required),
+			(33, self.failure, option),
 			(34, self.transition_id, required),
 			(36, self.status, required)
 		});
@@ -507,6 +522,7 @@ impl Readable for RecurrenceState {
 			(28, last_successful_payment_id, option),
 			(30, attempt, option),
 			(32, cancellation, required),
+			(33, failure, option),
 			(34, transition_id, required),
 			(36, status, required)
 		});
@@ -529,6 +545,7 @@ impl Readable for RecurrenceState {
 			last_successful_payment_id: last_successful_payment_id.0,
 			attempt: attempt.0,
 			cancellation: cancellation.0.ok_or(DecodeError::InvalidValue)?,
+			failure: failure.0,
 			transition_id: transition_id.0.ok_or(DecodeError::InvalidValue)?,
 			status: status.0.ok_or(DecodeError::InvalidValue)?,
 		};
@@ -583,6 +600,7 @@ mod tests {
 				amount_msat: 23,
 			}),
 			cancellation: RecurrenceCancellationState::Pending,
+			failure: Some(RecurrenceFailure::RouteFailed),
 			transition_id: 24,
 			status: RecurrenceStatus::RequiresAttention,
 		}
@@ -635,6 +653,7 @@ mod tests {
 		assert_eq!(actual.last_successful_payment_id, expected.last_successful_payment_id);
 		assert_eq!(actual.attempt, expected.attempt);
 		assert_eq!(actual.cancellation, expected.cancellation);
+		assert_eq!(actual.failure, expected.failure);
 		assert_eq!(actual.transition_id, expected.transition_id);
 		assert_eq!(actual.status, expected.status);
 	}
@@ -659,6 +678,7 @@ mod tests {
 		assert!(!defaults.pay_next_automatically);
 		assert_eq!(defaults.status, RecurrenceStatus::Active);
 		assert_eq!(defaults.cancellation, RecurrenceCancellationState::NotRequested);
+		assert_eq!(defaults.failure, None);
 	}
 
 	#[test]
@@ -846,5 +866,54 @@ mod tests {
 		assert_eq!(details.paid_count, before.paid_count);
 		assert_eq!(details.transition_id, before.transition_id);
 		assert_eq!(details.basetime, before.basetime);
+	}
+
+	#[test]
+	fn failed_payment_preserves_schedule_and_tracks_open_window() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		details.paid_count = 3;
+		details.basetime = Some(100);
+		let paid_count = details.paid_count;
+		let basetime = details.basetime;
+		record_failure(
+			&mut details,
+			PaymentId([60; 32]),
+			RecurrenceFailure::RouteFailed,
+			199,
+			Some(200),
+		);
+		assert_eq!(details.paid_count, paid_count);
+		assert_eq!(details.basetime, basetime);
+		assert_eq!(details.failure, Some(RecurrenceFailure::RouteFailed));
+		assert_eq!(details.status, RecurrenceStatus::Active);
+		assert!(details.attempt.is_none());
+
+		record_failure(
+			&mut details,
+			PaymentId([61; 32]),
+			RecurrenceFailure::Expired,
+			200,
+			Some(200),
+		);
+		assert_eq!(details.status, RecurrenceStatus::Missed);
+	}
+
+	#[test]
+	fn failure_after_success_does_not_change_recurrence() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		record_success(&mut details, PaymentId([62; 32]), 100, None, 0, None);
+		let snapshot = details.clone();
+		record_failure(
+			&mut details,
+			PaymentId([62; 32]),
+			RecurrenceFailure::Rejected,
+			200,
+			Some(200),
+		);
+		assert_eq!(details.paid_count, snapshot.paid_count);
+		assert_eq!(details.failure, snapshot.failure);
+		assert_eq!(details.status, snapshot.status);
 	}
 }
