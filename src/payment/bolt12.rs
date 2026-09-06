@@ -466,6 +466,64 @@ impl Bolt12Payment {
 		Ok(())
 	}
 
+	/// Cancels a recurring offer locally and, after the first successful payment, queues a
+	/// continuity-preserving cancellation request for the payee.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn cancel_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		let Some(mut details) = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+		else {
+			return Err(Error::InvalidOfferId);
+		};
+		if matches!(
+			details.status,
+			RecurrenceStatus::Cancelled
+				| RecurrenceStatus::Completed
+				| RecurrenceStatus::Missed
+				| RecurrenceStatus::RequiresAttention
+		) {
+			return Err(Error::InvalidOffer);
+		}
+		if details.status == RecurrenceStatus::CancellationPending {
+			return Ok(());
+		}
+
+		details.status = RecurrenceStatus::CancellationPending;
+		details.cancellation = RecurrenceCancellationState::Pending;
+		details.transition_id += 1;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details.clone()))
+			.map_err(|_| Error::PersistenceFailed)?;
+
+		if let Some(
+			RecurrenceAttempt::Prepared { payment_id, .. }
+			| RecurrenceAttempt::Submitted { payment_id, .. },
+		) = details.attempt
+		{
+			self.channel_manager.abandon_payment(payment_id);
+		}
+		if details.paid_count > 0 {
+			let offer = LdkOffer::try_from(details.original_offer.clone())
+				.map_err(|_| Error::InvalidOffer)?;
+			let counter = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+			let params = lightning::ln::channelmanager::RecurrenceCancellationParams {
+				counter,
+				start: details.initial_start,
+				prev_state: details.opaque_state.clone(),
+			};
+			let _ = self.channel_manager.cancel_recurrence(&offer, recurrence_id.into(), params);
+		}
+		details.status = RecurrenceStatus::Cancelled;
+		details.cancellation = RecurrenceCancellationState::Cancelled;
+		details.transition_id += 1;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details))
+			.map_err(|_| Error::PersistenceFailed)?;
+		Ok(())
+	}
+
 	pub(crate) fn send_using_amount_inner(
 		&self, offer: &Offer, amount_msat: u64, quantity: Option<u64>, payer_note: Option<String>,
 		route_parameters: Option<RouteParametersConfig>, hrn: Option<HumanReadableName>,
