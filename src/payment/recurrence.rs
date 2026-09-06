@@ -74,6 +74,25 @@ impl_ser_tlv_based!(RecurrenceRetryState, {
 	(2, next_retry_at, option),
 });
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecurrenceRetryPolicy {
+	pub max_retries: u32,
+}
+
+impl Default for RecurrenceRetryPolicy {
+	fn default() -> Self {
+		Self { max_retries: 3 }
+	}
+}
+
+impl_ser_tlv_based!(RecurrenceRetryPolicy, {
+	(0, max_retries, required),
+});
+
+pub(crate) fn recurrence_retry_delay(attempt: u32) -> u64 {
+	5u64.saturating_mul(1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX)).min(300)
+}
+
 /// The lifecycle state of a payment attempt for a recurring offer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RecurrenceAttempt {
@@ -153,6 +172,8 @@ pub(crate) struct RecurrenceState {
 	/// LDK retry strategy for one payment attempt.
 	pub retry_policy: Retry,
 	/// Recurrence-level retry state across payment attempts.
+	/// Maximum number of recurrence-level retries for one payment window.
+	pub recurrence_retry_policy: Option<RecurrenceRetryPolicy>,
 	pub retry_state: RecurrenceRetryState,
 	/// Whether the node should submit future periods automatically.
 	pub pay_next_automatically: bool,
@@ -243,7 +264,7 @@ pub(crate) fn record_success(
 /// Records a failed attempt without changing an already successful or terminal recurrence.
 pub(crate) fn record_failure(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, failure: RecurrenceFailure, now: u64,
-	closing_time: Option<u64>,
+	closing_time: Option<u64>, retry_policy: RecurrenceRetryPolicy,
 ) {
 	if details.last_successful_payment_id == Some(payment_id)
 		|| matches!(
@@ -254,6 +275,13 @@ pub(crate) fn record_failure(
 	}
 	details.attempt = None;
 	details.failure = Some(failure);
+	details.retry_state.attempts = details.retry_state.attempts.saturating_add(1);
+	if details.retry_state.attempts <= retry_policy.max_retries {
+		details.retry_state.next_retry_at =
+			now.checked_add(recurrence_retry_delay(details.retry_state.attempts));
+	} else {
+		details.retry_state.next_retry_at = None;
+	}
 	details.transition_id = details.transition_id.saturating_add(1);
 	if closing_time.map(|closing| now >= closing).unwrap_or(false) {
 		details.status = RecurrenceStatus::Missed;
@@ -511,6 +539,7 @@ impl Default for RecurrenceState {
 			payer_note: None,
 			routing_override: None,
 			retry_policy: Retry::Attempts(0),
+			recurrence_retry_policy: Some(RecurrenceRetryPolicy::default()),
 			retry_state: RecurrenceRetryState { attempts: 0, next_retry_at: None },
 			pay_next_automatically: false,
 			initial_start: None,
@@ -601,6 +630,7 @@ impl Writeable for RecurrenceState {
 			(10, self.payer_note, option),
 			(12, self.routing_override, option),
 			(14, self.retry_policy, required),
+			(15, self.recurrence_retry_policy, option),
 			(16, self.retry_state, required),
 			(18, self.pay_next_automatically, required),
 			(20, self.initial_start, required),
@@ -629,6 +659,7 @@ impl Readable for RecurrenceState {
 			(10, payer_note, option),
 			(12, routing_override, option),
 			(14, retry_policy, required),
+			(15, recurrence_retry_policy, option),
 			(16, retry_state, required),
 			(18, pay_next_automatically, required),
 			(20, initial_start, required),
@@ -652,6 +683,7 @@ impl Readable for RecurrenceState {
 			payer_note,
 			routing_override,
 			retry_policy: retry_policy.0.ok_or(DecodeError::InvalidValue)?,
+			recurrence_retry_policy,
 			retry_state: retry_state.0.ok_or(DecodeError::InvalidValue)?,
 			pay_next_automatically: pay_next_automatically.0.ok_or(DecodeError::InvalidValue)?,
 			initial_start: initial_start.0.ok_or(DecodeError::InvalidValue)?,
@@ -701,6 +733,7 @@ mod tests {
 				max_channel_saturation_power_of_half: 14,
 			}),
 			retry_policy: Retry::Attempts(15),
+			recurrence_retry_policy: Some(RecurrenceRetryPolicy { max_retries: 7 }),
 			retry_state: RecurrenceRetryState { attempts: 16, next_retry_at: Some(17) },
 			pay_next_automatically: true,
 			initial_start: Some(18),
@@ -757,6 +790,7 @@ mod tests {
 			expected.routing_override.as_ref().map(|v| v.max_channel_saturation_power_of_half)
 		);
 		assert_eq!(actual.retry_policy, expected.retry_policy);
+		assert_eq!(actual.recurrence_retry_policy, expected.recurrence_retry_policy);
 		assert_eq!(actual.retry_state, expected.retry_state);
 		assert_eq!(actual.pay_next_automatically, expected.pay_next_automatically);
 		assert_eq!(actual.initial_start, expected.initial_start);
@@ -1055,6 +1089,7 @@ mod tests {
 			RecurrenceFailure::RouteFailed,
 			199,
 			Some(200),
+			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.paid_count, paid_count);
 		assert_eq!(details.basetime, basetime);
@@ -1068,6 +1103,7 @@ mod tests {
 			RecurrenceFailure::Expired,
 			200,
 			Some(200),
+			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
 		assert_eq!(details.retry_state.next_retry_at, None);
@@ -1085,6 +1121,7 @@ mod tests {
 			RecurrenceFailure::Rejected,
 			200,
 			Some(200),
+			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.paid_count, snapshot.paid_count);
 		assert_eq!(details.failure, snapshot.failure);
@@ -1110,6 +1147,7 @@ mod tests {
 			RecurrenceFailure::Expired,
 			199,
 			Some(200),
+			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Active);
 		record_failure(
@@ -1118,6 +1156,7 @@ mod tests {
 			RecurrenceFailure::Expired,
 			200,
 			Some(200),
+			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
 	}
