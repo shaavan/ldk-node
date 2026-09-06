@@ -2455,12 +2455,59 @@ mod tests {
 
 	use lightning::offers::offer::{OfferBuilder, Quantity};
 	use lightning::offers::refund::RefundBuilder;
+	use lightning_invoice::{Currency, InvoiceBuilder};
 
 	use super::*;
 
 	fn create_test_bolt11_invoice() -> (LdkBolt11Invoice, Bolt11Invoice) {
 		let invoice_string = "lnbc1pn8g249pp5f6ytj32ty90jhvw69enf30hwfgdhyymjewywcmfjevflg6s4z86qdqqcqzzgxqyz5vqrzjqwnvuc0u4txn35cafc7w94gxvq5p3cu9dd95f7hlrh0fvs46wpvhdfjjzh2j9f7ye5qqqqryqqqqthqqpysp5mm832athgcal3m7h35sc29j63lmgzvwc5smfjh2es65elc2ns7dq9qrsgqu2xcje2gsnjp0wn97aknyd3h58an7sjj6nhcrm40846jxphv47958c6th76whmec8ttr2wmg6sxwchvxmsc00kqrzqcga6lvsf9jtqgqy5yexa";
 		let ldk_invoice: LdkBolt11Invoice = invoice_string.parse().unwrap();
+		let wrapped_invoice = Bolt11Invoice::from(ldk_invoice.clone());
+		(ldk_invoice, wrapped_invoice)
+	}
+
+	fn create_test_bolt11_invoice_without_payee_key() -> (LdkBolt11Invoice, Bolt11Invoice) {
+		let invoice = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("Test invoice".to_string())
+			.payment_hash(PaymentHash([1; 32]))
+			.payment_secret(PaymentSecret([2; 32]))
+			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.build_raw()
+			.unwrap()
+			.sign::<_, ()>(|hash| {
+				let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
+				Ok(bitcoin::secp256k1::Secp256k1::new().sign_ecdsa_recoverable(hash, &secret_key))
+			})
+			.unwrap();
+		let ldk_invoice = LdkBolt11Invoice::from_signed(invoice).unwrap();
+		let wrapped_invoice = Bolt11Invoice::from(ldk_invoice.clone());
+		(ldk_invoice, wrapped_invoice)
+	}
+
+	fn create_test_bolt11_invoice_with_payee_key() -> (LdkBolt11Invoice, Bolt11Invoice) {
+		let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let invoice = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("Test invoice".to_string())
+			.payment_hash(PaymentHash([4; 32]))
+			.payment_secret(PaymentSecret([5; 32]))
+			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.payee_pub_key(secret_key.public_key(&secp))
+			.build_raw()
+			.unwrap()
+			.sign::<_, ()>(|hash| {
+				let valid_signature = secp.sign_ecdsa_recoverable(hash, &secret_key);
+				let (_, signature_bytes) = valid_signature.serialize_compact();
+				let invalid_recovery_id =
+					bitcoin::secp256k1::ecdsa::RecoveryId::from_i32(2).unwrap();
+				Ok(bitcoin::secp256k1::ecdsa::RecoverableSignature::from_compact(
+					&signature_bytes,
+					invalid_recovery_id,
+				)
+				.unwrap())
+			})
+			.unwrap();
+		let ldk_invoice = LdkBolt11Invoice::from_signed(invoice).unwrap();
 		let wrapped_invoice = Bolt11Invoice::from(ldk_invoice.clone());
 		(ldk_invoice, wrapped_invoice)
 	}
@@ -2656,6 +2703,29 @@ mod tests {
 		let invoice_str = wrapped_invoice.to_string();
 		let parsed_invoice: LdkBolt11Invoice = invoice_str.parse().unwrap();
 		assert_eq!(ldk_invoice.payment_hash(), parsed_invoice.payment_hash(),);
+	}
+
+	#[test]
+	/// Verify that the FFI wrapper returns the same recovered payee key as the underlying invoice.
+	///
+	/// Comparing the optional result also checks that a failed recovery stays a failure instead of
+	/// being turned into a panic or an invented key.
+	fn test_bolt11_invoice_payee_key_signature_recovery() {
+		let (ldk_invoice, wrapped_invoice) = create_test_bolt11_invoice_without_payee_key();
+
+		assert!(ldk_invoice.payee_pub_key().is_none());
+		let recovered = ldk_invoice.recover_payee_pub_key();
+		assert!(recovered.is_some());
+		assert_eq!(wrapped_invoice.recover_payee_pub_key(), recovered);
+	}
+
+	#[test]
+	fn test_bolt11_invoice_payee_key_recovery_returns_none_when_key_is_embedded() {
+		let (ldk_invoice, wrapped_invoice) = create_test_bolt11_invoice_with_payee_key();
+
+		assert!(ldk_invoice.payee_pub_key().is_some());
+		assert_eq!(ldk_invoice.recover_payee_pub_key(), None);
+		assert_eq!(wrapped_invoice.recover_payee_pub_key(), None);
 	}
 
 	#[test]
