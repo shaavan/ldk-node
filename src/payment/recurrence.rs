@@ -570,6 +570,9 @@ impl From<OfferId> for RecurrenceId {
 mod tests {
 	use std::sync::Arc;
 
+	use lightning::offers::offer::{
+		Recurrence, RecurrenceLimit, RecurrencePaywindow, RecurrencePeriod, RecurrenceType,
+	};
 	use lightning::routing::router::RouteParametersConfig;
 	use lightning::util::ser::{Readable, Writeable};
 
@@ -817,8 +820,23 @@ mod tests {
 			1
 		);
 		let claimed = manager.get(&expected.id).await.unwrap().unwrap();
-		assert!(matches!(claimed.attempt, Some(RecurrenceAttempt::Prepared { .. })));
+		assert!(matches!(
+			claimed.attempt,
+			Some(RecurrenceAttempt::Prepared { payment_id, .. })
+				if payment_id == PaymentId([30; 32]) || payment_id == PaymentId([32; 32])
+		));
 		assert_eq!(claimed.transition_id, expected.transition_id + 1);
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_does_not_claim_cancelled_recurrence() {
+		let mut expected = state(None);
+		expected.status = RecurrenceStatus::Cancelled;
+		expected.cancellation = RecurrenceCancellationState::Cancelled;
+		let (manager, _) = manager(vec![expected.clone()]);
+		let attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([34; 32]), amount_msat: 35 };
+		assert!(manager.claim_attempt(&expected.id, attempt).await.unwrap().is_none());
 	}
 
 	#[tokio::test]
@@ -953,5 +971,24 @@ mod tests {
 			Some(200),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
+	}
+
+	#[test]
+	fn later_periods_are_sequential_and_window_boundaries_are_exact() {
+		let recurrence = Recurrence {
+			recurrence_type: RecurrenceType::Compulsory(None),
+			recurrence_period: RecurrencePeriod::Seconds(100),
+			recurrence_paywindow: Some(RecurrencePaywindow {
+				seconds_before: 0,
+				seconds_after: 100,
+			}),
+			recurrence_limit: Some(RecurrenceLimit(2)),
+		};
+		assert_eq!(recurrence.period_index(1, None).unwrap(), 1);
+		assert_eq!(recurrence.payment_window(1_000, 1).unwrap(), (1_100, 1_200));
+		assert!(recurrence.period_index(u32::MAX, Some(1)).is_err());
+		assert!(1_100 < 1_200);
+		assert!(1_200 >= 1_200);
+		assert!(recurrence.period_index(3, None).unwrap() > recurrence.recurrence_limit.unwrap().0);
 	}
 }
