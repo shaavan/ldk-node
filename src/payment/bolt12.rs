@@ -431,6 +431,38 @@ impl Bolt12Payment {
 		Ok(payment_id)
 	}
 
+	pub(crate) fn set_pay_next_automatically(
+		&self, recurrence_id: RecurrenceId, enabled: bool,
+	) -> Result<(), Error> {
+		let mut details = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::InvalidOfferId)?;
+		details.pay_next_automatically = enabled;
+		details.transition_id += 1;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details))
+			.map_err(|_| Error::PersistenceFailed)?;
+		Ok(())
+	}
+
+	pub(crate) fn set_recurrence_route_parameters(
+		&self, recurrence_id: RecurrenceId, route_parameters: Option<RouteParametersConfig>,
+	) -> Result<(), Error> {
+		let mut details = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::InvalidOfferId)?;
+		details.routing_override = route_parameters;
+		details.transition_id += 1;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details))
+			.map_err(|_| Error::PersistenceFailed)?;
+		Ok(())
+	}
+
 	pub(crate) fn send_using_amount_inner(
 		&self, offer: &Offer, amount_msat: u64, quantity: Option<u64>, payer_note: Option<String>,
 		route_parameters: Option<RouteParametersConfig>, hrn: Option<HumanReadableName>,
