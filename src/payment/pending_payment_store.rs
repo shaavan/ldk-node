@@ -145,10 +145,29 @@ impl From<&PendingPaymentDetails> for PendingPaymentDetailsUpdate {
 #[cfg(test)]
 mod tests {
 	use bitcoin::hashes::Hash;
+	use lightning::util::ser::Readable;
 
 	use super::*;
+	use crate::hex_utils;
 	use crate::payment::store::ConfirmationStatus;
 	use crate::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+
+	#[test]
+	/// Verify that funding candidates written with the pre-migration layout remain readable.
+	fn funding_candidate_reads_legacy_layout_fixture() {
+		let candidate = FundingTxCandidate {
+			txid: Txid::from_byte_array([9; 32]),
+			amount_msat: Some(50_000),
+			fee_paid_msat: Some(500),
+		};
+		let fixture = hex_utils::to_vec(
+			"36002009090909090909090909090909090909090909090909090909090909090909090208000000000000c350040800000000000001f4",
+		)
+		.unwrap();
+		let decoded = FundingTxCandidate::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded, candidate);
+	}
 
 	#[test]
 	fn pending_payment_candidate_lookup() {
@@ -189,7 +208,6 @@ mod tests {
 		);
 		let pending =
 			PendingPaymentDetails::new(details, vec![first_txid, counterparty_txid], candidates);
-
 		// Each candidate resolves to its own figures, so a non-last candidate that confirms reports
 		// its own (lower) fee rather than the last-broadcast candidate's.
 		assert_eq!(pending.candidate(first_txid).and_then(|c| c.fee_paid_msat), Some(1_000));
@@ -200,6 +218,28 @@ mod tests {
 		assert_eq!(counterparty.amount_msat, None);
 		assert_eq!(counterparty.fee_paid_msat, None);
 		assert_eq!(pending.candidate(Txid::from_byte_array([9u8; 32])), None);
+	}
+
+	#[test]
+	/// Verify that a complete pending-payment record written with the pre-migration layout remains
+	/// readable, including conflict and interactive-funding history.
+	fn pending_payment_details_reads_legacy_layout_fixture() {
+		let fixture = hex_utils::to_vec(
+			"fd0151007a79002001010101010101010101010101010101010101010101010101010101010101010201000328002600200303030303030303030303030303030303030303030303030303030303030303020202000401000508000000006aa5542606090900000000000f424007080000000000001388080201000a020000024002020202020202020202020202020202020202020202020202020202020202020404040404040404040404040404040404040404040404040404040404040404049122002004040404040404040404040404040404040404040404040404040404040404043600200202020202020202020202020202020202020202020202020202020202020202020800000000000f4240040800000000000003e83600200303030303030303030303030303030303030303030303030303030303030303020800000000000f424004080000000000001388",
+		)
+		.unwrap();
+		let decoded = PendingPaymentDetails::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded.details.id, PaymentId([1; 32]));
+		assert_eq!(
+			decoded.conflicting_txids,
+			vec![Txid::from_byte_array([2; 32]), Txid::from_byte_array([4; 32])]
+		);
+		assert_eq!(decoded.candidates.len(), 3);
+		assert_eq!(
+			decoded.candidate(Txid::from_byte_array([3; 32])).unwrap().fee_paid_msat,
+			Some(5_000)
+		);
 	}
 
 	fn test_txid(byte: u8) -> Txid {

@@ -714,4 +714,24 @@ impl From<&(u64, Vec<u8>)> for CustomTlvRecord {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use lightning::util::ser::Readable;
+
+	use super::CustomTlvRecord;
+
+	#[test]
+	/// Verify that a custom TLV record written with the pre-migration layout remains readable.
+	fn custom_tlv_record_reads_legacy_fixture() {
+		let fixture = [
+			0x11, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x02, 0x05, 0x00,
+			0x03, 0x01, 0x02, 0x03,
+		];
+		let decoded = CustomTlvRecord::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded.type_num, 42);
+		assert_eq!(decoded.value, vec![1, 2, 3]);
+	}
+}
+
 pub(crate) type PendingPaymentStore = DataStore<PendingPaymentDetails, Arc<Logger>, KeepAllEntries>;

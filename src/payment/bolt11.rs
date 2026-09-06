@@ -189,8 +189,11 @@ mod tests {
 		};
 		let metadata = PaymentMetadata { lsps2_parameters: Some(lsps2_parameters) };
 
-		let encoded = metadata.encode();
-		let decoded = PaymentMetadata::read(&mut &*encoded).unwrap();
+		let fixture = [
+			0x17, 0x00, 0x15, 0x14, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x10,
+			0x02, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x68,
+		];
+		let decoded = PaymentMetadata::read(&mut &fixture[..]).unwrap();
 
 		assert_eq!(metadata, decoded);
 	}

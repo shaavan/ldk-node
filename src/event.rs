@@ -2311,6 +2311,57 @@ mod tests {
 	}
 
 	#[tokio::test]
+	/// Verify that an incoming cancellation event survives persistence and replay, and that
+	/// acknowledging the event removes it from the persisted queue.
+	///
+	/// Replay must return the exact event, including its offer ID and payer signing key. Handling
+	/// it must persist an empty queue so a restart cannot deliver the same event again.
+	async fn incoming_payment_cancellation_is_serialized_and_replayed() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+		// Fixed values make it possible to verify that serialization preserves both event fields.
+		let expected_event = Event::IncomingPaymentCancelled {
+			offer_id: OfferId([23u8; 32]),
+			payer_signing_pubkey: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+		};
+
+		// Enqueuing persists the event before the application handles it.
+		event_queue.add_event(expected_event.clone()).await.unwrap();
+
+		// Recreate the queue from storage, matching what happens when the node starts again.
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let replayed_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), Arc::clone(&logger)))
+				.unwrap();
+		assert_eq!(replayed_queue.next_event(), Some(expected_event.clone()));
+
+		// Acknowledging the event persists its removal.
+		event_queue.event_handled().await.unwrap();
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let replayed_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger));
+		assert_eq!(replayed_queue.unwrap().next_event(), None);
+	}
+
+	#[tokio::test]
 	async fn event_queue_persistence() {
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
 		let logger = Arc::new(TestLogger::new());
@@ -2346,6 +2397,28 @@ mod tests {
 
 		event_queue.event_handled().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
+	}
+
+	#[test]
+	/// Verify that a queued event written with the pre-migration layout remains readable.
+	fn event_queue_reads_legacy_layout_fixture() {
+		let fixture = hex_utils::to_vec(
+			"0001033400201717171717171717171717171717171717171717171717171717171717171717021000000000000000000000000000000913",
+		)
+		.unwrap();
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let event_queue = EventQueue::read(&mut &fixture[..], (store, logger)).unwrap();
+
+		assert_eq!(
+			event_queue.next_event(),
+			Some(Event::ChannelReady {
+				channel_id: ChannelId([23; 32]),
+				user_channel_id: UserChannelId(2323),
+				counterparty_node_id: None,
+				funding_txo: None,
+			})
+		);
 	}
 
 	#[derive(Clone, Debug, PartialEq, Eq)]

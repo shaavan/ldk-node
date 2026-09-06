@@ -2570,9 +2570,17 @@ async fn connect_and_discover_lsp(
 
 #[cfg(test)]
 mod tests {
+	use std::str::FromStr;
+	use std::sync::Arc;
+
+	use lightning::events::Event as LdkEvent;
+	use lightning::offers::offer::OfferId;
 	use lightning::util::ser::{Readable, Writeable};
 
 	use super::*;
+	use crate::builder::NodeBuilder;
+	use crate::entropy::NodeEntropy;
+	use crate::io::test_utils::InMemoryStore;
 
 	#[test]
 	fn node_metrics_reads_legacy_rgs_snapshot_timestamp() {
@@ -2617,5 +2625,55 @@ mod tests {
 		assert_eq!(new.latest_fee_rate_cache_update_timestamp, Some(1_200));
 		assert_eq!(new.latest_pathfinding_scores_sync_timestamp, Some(1_300));
 		assert_eq!(new.latest_node_announcement_broadcast_timestamp, Some(2_000));
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	/// Verify that the LDK cancellation event is translated into the public queued event without
+	/// changing either identifier carried by the cancellation.
+	async fn recurring_offer_cancelled_is_queued_as_incoming_payment_cancelled() {
+		let node = NodeBuilder::new()
+			.build_with_store(NodeEntropy::from_seed_bytes([42; 64]), InMemoryStore::new())
+			.unwrap();
+		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
+			Arc::clone(&node.tx_broadcaster),
+			Arc::new(LdkWallet::new(Arc::clone(&node.wallet), Arc::clone(&node.logger))),
+			Arc::clone(&node.keys_manager),
+			Arc::clone(&node.logger),
+		));
+		let event_handler = EventHandler::new(
+			Arc::clone(&node.event_queue),
+			Arc::clone(&node.wallet),
+			bump_tx_event_handler,
+			Arc::clone(&node.channel_manager),
+			Arc::clone(&node.connection_manager),
+			Arc::clone(&node.output_sweeper),
+			Arc::clone(&node.network_graph),
+			Arc::clone(&node.liquidity_source),
+			Arc::clone(&node.payment_store),
+			Arc::clone(&node.peer_store),
+			Arc::clone(&node.keys_manager),
+			None,
+			Arc::clone(&node.onion_messenger),
+			node.om_mailbox.clone(),
+			node.prober.clone(),
+			Arc::clone(&node.runtime),
+			Arc::clone(&node.logger),
+			Arc::clone(&node.config),
+		);
+
+		let offer_id = OfferId([23; 32]);
+		let payer_signing_pubkey = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		event_handler
+			.handle_event(LdkEvent::RecurringOfferCancelled { offer_id, payer_signing_pubkey })
+			.await
+			.unwrap();
+
+		assert_eq!(
+			node.event_queue.next_event(),
+			Some(Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey })
+		);
 	}
 }

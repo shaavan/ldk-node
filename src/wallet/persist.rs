@@ -315,11 +315,23 @@ mod tests {
 	use bitcoin::Network;
 	use lightning::io;
 	use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
+	use lightning::util::ser::Readable;
 
 	use super::KVStoreWalletPersister;
+	use crate::hex_utils;
 	use crate::io::test_utils::InMemoryStore;
 	use crate::logger::Logger;
 	use crate::types::{DynStore, DynStoreWrapper};
+
+	#[test]
+	/// Verify that address-pool records written with the pre-migration layout remain readable.
+	fn address_pool_reads_legacy_layout_fixture() {
+		let indices = vec![3, 8, 13];
+		let fixture = hex_utils::to_vec("0e000c00000003000000080000000d").unwrap();
+		let decoded = super::AddressPoolRecord::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded.indices, indices);
+	}
 
 	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
 	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";

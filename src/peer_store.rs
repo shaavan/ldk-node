@@ -178,8 +178,48 @@ mod tests {
 	use lightning::util::test_utils::TestLogger;
 
 	use super::*;
+	use crate::hex_utils;
 	use crate::io::test_utils::InMemoryStore;
 	use crate::types::DynStoreWrapper;
+
+	#[test]
+	/// Verify that peer records written with the pre-migration layout remain readable.
+	fn peer_info_reads_legacy_layout_fixture() {
+		let node_id = PublicKey::from_str(
+			"0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993",
+		)
+		.unwrap();
+		let address = SocketAddress::from_str("127.0.0.1:9738").unwrap();
+		let fixture = hex_utils::to_vec(
+			"2c00210276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e59930207017f000001260a",
+		)
+		.unwrap();
+		let decoded = PeerInfo::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded, PeerInfo { node_id, address });
+	}
+
+	#[test]
+	/// Verify that the complete peer-store wrapper written with the pre-migration layout remains
+	/// readable, not just an individual peer record.
+	fn peer_store_reads_legacy_layout_fixture() {
+		let node_id = PublicKey::from_str(
+			"0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993",
+		)
+		.unwrap();
+		let expected =
+			PeerInfo { node_id, address: SocketAddress::from_str("127.0.0.1:9738").unwrap() };
+		let fixture = hex_utils::to_vec(
+			"00010276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e59932c00210276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e59930207017f000001260a",
+		)
+		.unwrap();
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let decoded = PeerStore::read(&mut &fixture[..], (store, logger)).unwrap();
+
+		assert_eq!(decoded.get_peer(&node_id), Some(expected.clone()));
+		assert_eq!(decoded.list_peers(), vec![expected]);
+	}
 
 	struct FailingStore;
 
