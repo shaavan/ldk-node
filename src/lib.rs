@@ -838,6 +838,29 @@ impl Node {
 			}
 		});
 
+		#[cfg(not(feature = "uniffi"))]
+		{
+			let scheduler_payment = self.bolt12_payment();
+			let scheduler_manager = Arc::clone(&self.recurrence_manager);
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(60));
+				loop {
+					interval.tick().await;
+					if !scheduler_manager.is_recovery_complete() {
+						continue;
+					}
+					for details in scheduler_manager.list().await {
+						if details.status == crate::payment::recurrence::RecurrenceStatus::Active
+							&& details.pay_next_automatically
+							&& details.attempt.is_none()
+						{
+							let _ = scheduler_payment.pay_next_recurrence(details.id);
+						}
+					}
+				}
+			});
+		}
+
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
 		Ok(())
