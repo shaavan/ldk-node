@@ -1281,4 +1281,16 @@ mod tests {
 		);
 		assert_eq!(details.retry_state.next_retry_at, None);
 	}
+
+	#[test]
+	fn cancellation_state_is_terminal_and_late_success_does_not_resume() {
+		let mut details = state(Some(vec![9, 9]));
+		details.status = RecurrenceStatus::Cancelled;
+		details.cancellation = RecurrenceCancellationState::Cancelled;
+		details.paid_count = 1;
+		record_success(&mut details, PaymentId([90; 32]), 100, Some(&[1]), 1, None);
+		assert_eq!(details.status, RecurrenceStatus::Cancelled);
+		assert_eq!(details.cancellation, RecurrenceCancellationState::Cancelled);
+		assert_eq!(details.paid_count, 2);
+	}
 }
