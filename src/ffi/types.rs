@@ -2659,6 +2659,20 @@ mod tests {
 	}
 
 	#[test]
+	/// Verify that the FFI wrapper returns the same recovered payee key as the underlying invoice.
+	///
+	/// Comparing the optional result also checks that a failed recovery stays a failure instead of
+	/// being turned into a panic or an invented key.
+	fn test_bolt11_invoice_payee_key_signature_recovery() {
+		let (ldk_invoice, wrapped_invoice) = create_test_bolt11_invoice();
+
+		assert_eq!(
+			wrapped_invoice.recover_payee_pub_key(),
+			ldk_invoice.recover_payee_pub_key().ok().map(|key| key.0)
+		);
+	}
+
+	#[test]
 	fn test_offer() {
 		let (ldk_offer, wrapped_offer) = create_test_offer();
 		match (ldk_offer.description(), wrapped_offer.offer_description()) {

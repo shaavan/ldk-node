@@ -102,6 +102,35 @@ impl UnifiedPayment {
 	}
 }
 
+/// Returns the deterministic preference used when trying multiple payment methods.
+///
+/// Supported Lightning and on-chain methods retain their existing priority. Methods recognized
+/// by the parser but not implemented by LDK Node are placed after them so they cannot prevent a
+/// supported fallback from being attempted.
+fn payment_method_priority(method: &PaymentMethod) -> u8 {
+	match method {
+		PaymentMethod::LightningBolt12(_) => 0,
+		PaymentMethod::LightningBolt11(_) => 1,
+		PaymentMethod::OnChain(_) => 2,
+		PaymentMethod::Bark(_) => 3,
+		PaymentMethod::Cashu(_) => 4,
+	}
+}
+
+/// Reports whether LDK Node can submit a payment through the given parsed method.
+///
+/// Bark and Cashu instructions remain valid parser results, but require payment backends that are
+/// not part of this node. Keeping this decision explicit prevents unsupported methods from being
+/// mistaken for failed Lightning or on-chain attempts.
+fn supports_payment_method(method: &PaymentMethod) -> bool {
+	matches!(
+		method,
+		PaymentMethod::LightningBolt12(_)
+			| PaymentMethod::LightningBolt11(_)
+			| PaymentMethod::OnChain(_)
+	)
+}
+
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl UnifiedPayment {
 	/// Generates a URI with an on-chain address, [BOLT 11] invoice and [BOLT 12] offer.
@@ -256,15 +285,7 @@ impl UnifiedPayment {
 		};
 
 		let mut sorted_payment_methods = resolved.methods().to_vec();
-		sorted_payment_methods.sort_by_key(|method| match method {
-			PaymentMethod::LightningBolt12(_) => 0,
-			PaymentMethod::LightningBolt11(_) => 1,
-			PaymentMethod::OnChain(_) => 2,
-			// Bark and Cashu are recognized by the URI parser but unsupported by this node.
-			// Keep them in ordering so every parsed method is handled deterministically.
-			PaymentMethod::Bark(_) => 3,
-			PaymentMethod::Cashu(_) => 4,
-		});
+		sorted_payment_methods.sort_by_key(payment_method_priority);
 
 		for method in sorted_payment_methods {
 			match method {
@@ -342,9 +363,11 @@ impl UnifiedPayment {
 						.await?;
 					return Ok(UnifiedPaymentResult::Onchain { txid });
 				},
-				// These methods are valid BIP 21 payment methods, but this node has no
+				// These methods are valid payment instructions, but this node has no
 				// implementation for sending them. Continue to the next fallback method.
-				PaymentMethod::Bark(_) | PaymentMethod::Cashu(_) => {},
+				unsupported @ (PaymentMethod::Bark(_) | PaymentMethod::Cashu(_)) => {
+					debug_assert!(!supports_payment_method(&unsupported));
+				},
 			}
 		}
 
@@ -501,8 +524,35 @@ mod tests {
 
 	use bitcoin::address::NetworkUnchecked;
 	use bitcoin::{Address, Network};
+	use bitcoin_payment_instructions::PaymentMethod;
 
-	use super::{maybe_wrap, Amount, Bolt11Invoice, Extras, LdkOffer};
+	use super::{
+		maybe_wrap, payment_method_priority, supports_payment_method, Amount, Bolt11Invoice,
+		Extras, LdkOffer,
+	};
+
+	#[test]
+	/// Verify that parser additions for Bark and Cashu remain visible to unified-payment callers.
+	///
+	/// LDK Node does not send either method, but it must still recognize them so a unified request
+	/// can skip them and continue trying a supported fallback method.
+	fn parsed_methods_have_deterministic_support_and_priority() {
+		let bark = "ark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mqkr4cf5";
+		let cashu = "CREQB1QYQQWER9D4HNZV3NQGQQSQQQQQQQQQQRAQPSQQGQQSQQZQG9QQVXSAR5WPEN5TE0D45KUAPWV4UXZMTSD3JJUCM0D5RQQRJRDANXVET9YPCXZ7TDV4H8GXHR3TQ";
+		let methods = [
+			PaymentMethod::Bark(bark.parse().unwrap()),
+			PaymentMethod::Cashu(cashu.parse().unwrap()),
+		];
+
+		let bark_method = &methods[0];
+		assert!(!supports_payment_method(bark_method));
+		assert_eq!(payment_method_priority(bark_method), 3);
+
+		let cashu_method = &methods[1];
+		assert!(matches!(cashu_method, PaymentMethod::Cashu(_)));
+		assert!(!supports_payment_method(cashu_method));
+		assert_eq!(payment_method_priority(cashu_method), 4);
+	}
 
 	#[test]
 	fn parse_uri() {

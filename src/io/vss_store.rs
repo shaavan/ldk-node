@@ -1121,6 +1121,19 @@ mod nonce_tests {
 	use vss_client::types::{ErrorCode, ErrorResponse, ListKeyVersionsResponse, PutObjectResponse};
 
 	use super::*;
+	use crate::hex_utils;
+
+	#[test]
+	/// Verify that a VSS schema version written with the old format remains readable.
+	///
+	/// The fixed bytes represent version one. Reading them checks that an upgrade does not lose the
+	/// version needed to interpret the rest of the stored VSS data.
+	fn schema_version_reads_legacy_layout_fixture() {
+		let fixture = hex_utils::to_vec("0100").unwrap();
+		let decoded = VssSchemaVersion::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded, VssSchemaVersion::V1);
+	}
 
 	fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
 		let mut request = Vec::new();

@@ -182,15 +182,23 @@ mod tests {
 	}
 
 	#[test]
-	fn lsps2_parameters_roundtrip() {
+	/// Verify that BOLT11 payment metadata written with the old format still contains the LSPS2
+	/// fee limits.
+	///
+	/// Reading fixed bytes checks the format independently of the current writer, so existing
+	/// invoices remain readable after the serializer change.
+	fn reads_lsps2_fee_limits_from_old_format() {
 		let lsps2_parameters = LSPS2Parameters {
 			max_total_opening_fee_msat: Some(42_000),
 			max_proportional_opening_fee_ppm_msat: Some(17_000),
 		};
 		let metadata = PaymentMetadata { lsps2_parameters: Some(lsps2_parameters) };
 
-		let encoded = metadata.encode();
-		let decoded = PaymentMetadata::read(&mut &*encoded).unwrap();
+		let fixture = [
+			0x17, 0x00, 0x15, 0x14, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x10,
+			0x02, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x68,
+		];
+		let decoded = PaymentMetadata::read(&mut &fixture[..]).unwrap();
 
 		assert_eq!(metadata, decoded);
 	}
