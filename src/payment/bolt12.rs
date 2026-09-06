@@ -241,6 +241,9 @@ impl Bolt12Payment {
 			payer_note: payer_note.clone().map(UntrustedString),
 			routing_override: route_parameters,
 			retry_policy,
+			recurrence_retry_policy: Some(
+				crate::payment::recurrence::RecurrenceRetryPolicy::default(),
+			),
 			retry_state: RecurrenceRetryState { attempts: 0, next_retry_at: None },
 			pay_next_automatically: false,
 			initial_start,
