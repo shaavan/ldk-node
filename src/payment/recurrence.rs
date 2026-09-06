@@ -709,7 +709,7 @@ mod tests {
 				max_channel_saturation_power_of_half: 14,
 			}),
 			retry_policy: Retry::Attempts(15),
-			recurrence_retry_policy: Some(RecurrenceRetryPolicy { max_retries: 7 }),
+			recurrence_retry_policy: Some(RecurrenceRetryPolicy { max_retries: 15 }),
 			retry_state: RecurrenceRetryState { attempts: 16, next_retry_at: Some(17) },
 			pay_next_automatically: true,
 			initial_start: Some(18),
@@ -1185,5 +1185,44 @@ mod tests {
 		assert_eq!(RecurrencePeriod::Days(1).start_time(86_400, 2), Ok(259_200));
 		assert_eq!(RecurrencePeriod::Months(1).start_time(1_706_742_800, 1), Ok(1_709_248_400));
 		assert_eq!(RecurrencePeriod::Months(1).start_time(1_709_251_200, 1), Ok(1_711_929_600));
+	}
+
+	#[test]
+	fn recurrence_retry_policy_uses_bounded_exponential_backoff() {
+		assert_eq!(recurrence_retry_delay(1), 5);
+		assert_eq!(recurrence_retry_delay(2), 10);
+		assert_eq!(recurrence_retry_delay(3), 20);
+		assert_eq!(recurrence_retry_delay(10), 300);
+		let policy = RecurrenceRetryPolicy::default();
+		assert_eq!(policy.max_retries, 3);
+		assert_eq!(policy, RecurrenceRetryPolicy::read(&mut &policy.encode()[..]).unwrap());
+	}
+
+	#[test]
+	fn recurrence_retry_limit_and_window_are_persisted() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		details.recurrence_retry_policy = Some(RecurrenceRetryPolicy { max_retries: 1 });
+		details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+		let retry_policy = details.recurrence_retry_policy.unwrap();
+		record_failure(
+			&mut details,
+			PaymentId([80; 32]),
+			RecurrenceFailure::RouteFailed,
+			100,
+			Some(200),
+			retry_policy,
+		);
+		assert_eq!(details.retry_state.attempts, 1);
+		assert_eq!(details.retry_state.next_retry_at, Some(105));
+		record_failure(
+			&mut details,
+			PaymentId([81; 32]),
+			RecurrenceFailure::RouteFailed,
+			110,
+			Some(200),
+			retry_policy,
+		);
+		assert_eq!(details.retry_state.next_retry_at, None);
 	}
 }
