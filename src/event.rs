@@ -52,7 +52,7 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use crate::payment::recurrence::{
-	RecurrenceAttempt, RecurrenceManager, RecurrenceRetryState, RecurrenceStatus,
+	record_success, RecurrenceAttempt, RecurrenceManager, RecurrenceRetryState, RecurrenceStatus,
 };
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
@@ -800,22 +800,18 @@ where
 			return Ok(());
 		};
 
-		let paid_count = details.paid_count.saturating_add(1);
-		let counter = u32::try_from(paid_count.saturating_sub(1)).unwrap_or(u32::MAX);
+		let counter = u32::try_from(details.paid_count).unwrap_or(u32::MAX);
 		let recurrence = offer.offer_recurrence().ok_or(ReplayEvent())?;
 		let period_index =
 			recurrence.period_index(counter, details.initial_start).map_err(|_| ReplayEvent())?;
-		details.paid_count = paid_count;
-		details.basetime.get_or_insert(invoice_recurrence.recurrence_basetime());
-		details.opaque_state =
-			invoice_recurrence.recurrence_next_state().map(|state| state.to_vec());
-		details.last_successful_payment_id = Some(payment_id);
-		details.attempt = None;
-		details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
-		details.transition_id += 1;
-		if recurrence.recurrence_limit.map(|limit| period_index >= limit.0).unwrap_or(false) {
-			details.status = RecurrenceStatus::Completed;
-		}
+		record_success(
+			&mut details,
+			payment_id,
+			invoice_recurrence.recurrence_basetime(),
+			invoice_recurrence.recurrence_next_state(),
+			period_index,
+			recurrence.recurrence_limit.map(|limit| limit.0),
+		);
 		self.recurrence_manager.update(details).await.map_err(|e| {
 			log_error!(self.logger, "Failed to advance recurrence: {}", e);
 			ReplayEvent()
