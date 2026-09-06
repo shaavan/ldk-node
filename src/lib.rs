@@ -2657,6 +2657,7 @@ mod tests {
 			Arc::clone(&node.network_graph),
 			Arc::clone(&node.liquidity_source),
 			Arc::clone(&node.payment_store),
+			Arc::clone(&node.recurrence_manager),
 			Arc::clone(&node.peer_store),
 			Arc::clone(&node.keys_manager),
 			None,
