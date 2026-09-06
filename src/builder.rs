@@ -83,6 +83,7 @@ use crate::io::{
 	self, PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 	PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	RECURRENCE_INFO_PERSISTENCE_PRIMARY_NAMESPACE, RECURRENCE_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::{LSPS2ServiceConfig, LiquiditySourceBuilder, LspConfig};
 use crate::lnurl_auth::LnurlAuth;
@@ -101,7 +102,7 @@ use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreRef, DynStoreWrapper,
 	GossipSync, Graph, KeysManager, MessageRouter, OnionMessenger, PaymentStore, PeerManager,
-	PendingPaymentStore,
+	PendingPaymentStore, RecurrenceStore,
 };
 use crate::wallet::persist::{read_address_pool, KVStoreWalletPersister};
 use crate::wallet::Wallet;
@@ -1524,26 +1525,37 @@ fn build_with_store_internal(
 
 	let kv_store_ref = Arc::clone(&kv_store);
 	let logger_ref = Arc::clone(&logger);
-	let (payment_store_res, node_metris_res, pending_payment_store_res, address_pool_res) = runtime
-		.block_on(async move {
-			tokio::join!(
-				read_n_objects(
-					&*kv_store_ref,
-					PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-					PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-					PAYMENT_CACHE_WARMUP_COUNT,
-					Arc::clone(&logger_ref),
-				),
-				read_node_metrics(&*kv_store_ref, Arc::clone(&logger_ref)),
-				read_all_objects(
-					&*kv_store_ref,
-					PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-					PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-					Arc::clone(&logger_ref),
-				),
-				read_address_pool(&*kv_store_ref, &*logger_ref)
-			)
-		});
+	let (
+		payment_store_res,
+		node_metris_res,
+		pending_payment_store_res,
+		recurrence_res,
+		address_pool_res,
+	) = runtime.block_on(async move {
+		tokio::join!(
+			read_n_objects(
+				&*kv_store_ref,
+				PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+				PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+				PAYMENT_CACHE_WARMUP_COUNT,
+				Arc::clone(&logger_ref),
+			),
+			read_node_metrics(&*kv_store_ref, Arc::clone(&logger_ref)),
+			read_all_objects(
+				&*kv_store_ref,
+				PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+				PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+				Arc::clone(&logger_ref),
+			),
+			read_all_objects(
+				&*kv_store_ref,
+				RECURRENCE_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+				RECURRENCE_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+				Arc::clone(&logger_ref),
+			),
+			read_address_pool(&*kv_store_ref, &*logger_ref)
+		)
+	});
 
 	// Initialize the status fields.
 	let node_metrics = match node_metris_res {
@@ -1861,6 +1873,21 @@ fn build_with_store_internal(
 		Ok(indices) => indices,
 		Err(e) => {
 			log_error!(logger, "Failed to read address pool data from store: {}", e);
+			return Err(BuildError::ReadFailed);
+		},
+	};
+
+	let recurrence_store = match recurrence_res {
+		Ok(recurrences) => Arc::new(RecurrenceStore::new(
+			recurrences,
+			KeepAllEntries,
+			RECURRENCE_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			RECURRENCE_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		)),
+		Err(e) => {
+			log_error!(logger, "Failed to read recurrence data from store: {}", e);
 			return Err(BuildError::ReadFailed);
 		},
 	};
@@ -2484,6 +2511,7 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
+		recurrence_store,
 		lnurl_auth,
 		is_running,
 		node_metrics,
@@ -2587,11 +2615,18 @@ mod tests {
 		CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 		CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 	};
+	use lightning::util::ser::Writeable;
 
 	use super::{sanitize_alias, BuildError, NodeAlias, NodeBuilder};
+	use crate::data_store::StorableObjectId;
 	use crate::entropy::NodeEntropy;
 	use crate::io::test_utils::InMemoryStore;
+	use crate::io::{
+		RECURRENCE_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+		RECURRENCE_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
 	use crate::logger::Logger;
+	use crate::payment::recurrence::{RecurrenceDetails, RecurrenceId, RecurrenceStatus};
 
 	struct ChannelManagerReadFailingStore(InMemoryStore);
 
