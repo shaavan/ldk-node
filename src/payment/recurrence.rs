@@ -60,7 +60,7 @@ impl StorableObjectId for RecurrenceId {
 
 /// The lifecycle status of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceStatus {
+pub enum RecurrenceStatus {
 	Active,
 	CancellationPending,
 	Cancelled,
@@ -80,7 +80,7 @@ impl_ser_tlv_based_enum!(RecurrenceStatus,
 
 /// The state of a recurring payment's retry schedule.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecurrenceRetryState {
+pub struct RecurrenceRetryState {
 	pub attempts: u32,
 	pub next_retry_at: Option<u64>,
 }
@@ -91,7 +91,7 @@ impl_ser_tlv_based!(RecurrenceRetryState, {
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecurrenceRetryPolicy {
+pub struct RecurrenceRetryPolicy {
 	pub max_retries: u32,
 }
 
@@ -111,7 +111,7 @@ pub(crate) fn recurrence_retry_delay(attempt: u32) -> u64 {
 
 /// The lifecycle state of a payment attempt for a recurring offer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceAttempt {
+pub enum RecurrenceAttempt {
 	Prepared { payment_id: PaymentId, amount_msat: u64 },
 	Submitted { payment_id: PaymentId, amount_msat: u64 },
 }
@@ -129,7 +129,7 @@ impl_ser_tlv_based_enum!(RecurrenceAttempt,
 
 /// The cancellation state of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceCancellationState {
+pub enum RecurrenceCancellationState {
 	NotRequested,
 	Pending,
 	Cancelled,
@@ -142,7 +142,7 @@ impl_ser_tlv_based_enum!(RecurrenceCancellationState,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecurrenceFailure {
+pub enum RecurrenceFailure {
 	Expired,
 	Rejected,
 	RouteFailed,
@@ -160,7 +160,7 @@ impl_ser_tlv_based_enum!(RecurrenceFailure,
 
 /// Persisted state for one recurring offer.
 #[derive(Clone, Debug)]
-pub(crate) struct RecurrenceState {
+pub struct RecurrenceState {
 	pub id: RecurrenceId,
 	pub original_offer: Vec<u8>,
 	pub amount_msat: Option<u64>,
@@ -184,7 +184,42 @@ pub(crate) struct RecurrenceState {
 	pub status: RecurrenceStatus,
 }
 
-pub(crate) type RecurrenceDetails = RecurrenceState;
+pub type RecurrenceDetails = RecurrenceState;
+
+#[derive(Clone, Debug)]
+pub struct RecurrenceConfig {
+	pub amount_msat: Option<u64>,
+	pub maximum_amount_msat: Option<u64>,
+	pub quantity: Option<u64>,
+	pub payer_note: Option<String>,
+	pub routing_override: Option<RouteParametersConfig>,
+	pub initial_start: Option<u32>,
+	pub pay_next_automatically: bool,
+	pub retry_policy: RecurrenceRetryPolicy,
+}
+
+impl Default for RecurrenceConfig {
+	fn default() -> Self {
+		Self {
+			amount_msat: None,
+			maximum_amount_msat: None,
+			quantity: None,
+			payer_note: None,
+			routing_override: None,
+			initial_start: None,
+			pay_next_automatically: false,
+			retry_policy: RecurrenceRetryPolicy::default(),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecurrencePaymentWindow {
+	pub period_index: u32,
+	pub opens_at: u64,
+	pub closes_at: u64,
+	pub currently_payable: bool,
+}
 
 pub(crate) fn record_success(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, basetime: u64,
