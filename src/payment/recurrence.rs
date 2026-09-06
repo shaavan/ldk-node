@@ -6,9 +6,10 @@
 // accordance with one or both of these licenses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
 use lightning::offers::offer::OfferId;
@@ -290,12 +291,17 @@ pub(crate) fn record_failure(
 pub(crate) struct RecurrenceManager {
 	store: Arc<RecurrenceStore>,
 	payment_index: Mutex<HashMap<PaymentId, RecurrenceId>>,
+	recovery_complete: AtomicBool,
 }
 
 impl RecurrenceManager {
 	/// Creates a manager backed by the durable recurrence store.
 	pub(crate) fn new(store: Arc<RecurrenceStore>) -> Self {
-		Self { store, payment_index: Mutex::new(HashMap::new()) }
+		Self {
+			store,
+			payment_index: Mutex::new(HashMap::new()),
+			recovery_complete: AtomicBool::new(false),
+		}
 	}
 
 	/// Returns the store used for durable recurrence records.
@@ -320,6 +326,75 @@ impl RecurrenceManager {
 				index.insert(payment_id, details.id);
 			}
 		}
+	}
+
+	/// Reconciles durable attempts with LDK's recent-payment history after restart.
+	///
+	/// Prepared attempts are returned for resubmission when LDK has no matching payment, while
+	/// pending and fulfilled attempts are promoted without creating duplicate payments.
+	pub(crate) async fn reconcile_attempts(
+		&self, recent_payments: &[RecentPaymentDetails],
+	) -> Result<Vec<RecurrenceDetails>, crate::Error> {
+		let recent: HashMap<PaymentId, &RecentPaymentDetails> = recent_payments
+			.iter()
+			.filter_map(|payment| {
+				let id = match payment {
+					RecentPaymentDetails::AwaitingInvoice { payment_id }
+					| RecentPaymentDetails::Pending { payment_id, .. }
+					| RecentPaymentDetails::Abandoned { payment_id, .. }
+					| RecentPaymentDetails::Fulfilled { payment_id, .. } => *payment_id,
+				};
+				Some((id, payment))
+			})
+			.collect();
+		let mut retry = Vec::new();
+		for mut details in self.list().await {
+			let Some(attempt) = details.attempt.clone() else {
+				continue;
+			};
+			let (payment_id, amount_msat, prepared) = match attempt {
+				RecurrenceAttempt::Prepared { payment_id, amount_msat } => {
+					(payment_id, amount_msat, true)
+				},
+				RecurrenceAttempt::Submitted { payment_id, amount_msat } => {
+					(payment_id, amount_msat, false)
+				},
+			};
+			match recent.get(&payment_id) {
+				Some(RecentPaymentDetails::Fulfilled { .. }) => {
+					details.last_successful_payment_id = Some(payment_id);
+					details.paid_count = details.paid_count.saturating_add(1);
+					details.attempt = None;
+					details.failure = None;
+					details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details).await?;
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) if prepared => {
+					details.attempt =
+						Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details).await?;
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) => {},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None if prepared => {
+					retry.push(details)
+				},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None => {},
+			}
+		}
+		self.recovery_complete.store(true, Ordering::Release);
+		Ok(retry)
+	}
+
+	pub(crate) fn is_recovery_complete(&self) -> bool {
+		self.recovery_complete.load(Ordering::Acquire)
 	}
 
 	/// Persists a new recurrence and indexes its known payment identifiers.

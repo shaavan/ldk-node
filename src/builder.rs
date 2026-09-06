@@ -2151,6 +2151,10 @@ fn build_with_store_internal(
 	};
 
 	let channel_manager = Arc::new(channel_manager);
+	let recent_payments = channel_manager.list_recent_payments();
+	if runtime.block_on(recurrence_manager.reconcile_attempts(&recent_payments)).is_err() {
+		return Err(BuildError::ReadFailed);
+	}
 
 	// Give ChannelMonitors to ChainMonitor
 	for (_blockhash, channel_monitor) in channel_monitors.into_iter() {
