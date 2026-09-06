@@ -902,6 +902,7 @@ mod tests {
 			Some(200),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
+		assert_eq!(details.retry_state.next_retry_at, None);
 	}
 
 	#[test]
@@ -920,5 +921,36 @@ mod tests {
 		assert_eq!(details.paid_count, snapshot.paid_count);
 		assert_eq!(details.failure, snapshot.failure);
 		assert_eq!(details.status, snapshot.status);
+	}
+
+	#[test]
+	fn failure_classifications_round_trip_and_closing_is_exclusive() {
+		for failure in [
+			RecurrenceFailure::Expired,
+			RecurrenceFailure::Rejected,
+			RecurrenceFailure::RouteFailed,
+			RecurrenceFailure::Abandoned,
+			RecurrenceFailure::Unknown,
+		] {
+			assert_eq!(failure, RecurrenceFailure::read(&mut &failure.encode()[..]).unwrap());
+		}
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		record_failure(
+			&mut details,
+			PaymentId([63; 32]),
+			RecurrenceFailure::Expired,
+			199,
+			Some(200),
+		);
+		assert_eq!(details.status, RecurrenceStatus::Active);
+		record_failure(
+			&mut details,
+			PaymentId([64; 32]),
+			RecurrenceFailure::Expired,
+			200,
+			Some(200),
+		);
+		assert_eq!(details.status, RecurrenceStatus::Missed);
 	}
 }
