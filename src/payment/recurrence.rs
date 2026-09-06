@@ -313,3 +313,266 @@ impl Readable for RecurrenceState {
 		Ok(state)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use lightning::routing::router::RouteParametersConfig;
+	use lightning::util::persist::KVStore;
+	use lightning::util::ser::{BigSize, Readable, Writeable};
+
+	use super::*;
+
+	fn state(opaque_state: Option<Vec<u8>>) -> RecurrenceState {
+		RecurrenceState {
+			id: RecurrenceId([1; 32]),
+			original_offer: vec![2, 3, 4],
+			amount_msat: Some(5_000),
+			maximum_amount_msat: Some(7_000),
+			quantity: Some(2),
+			payer_note: Some(UntrustedString("payer note".to_string())),
+			routing_override: Some(RouteParametersConfig {
+				max_total_routing_fee_msat: Some(11),
+				max_total_cltv_expiry_delta: 12,
+				max_path_count: 13,
+				max_channel_saturation_power_of_half: 14,
+			}),
+			retry_policy: Retry::Attempts(15),
+			retry_state: RecurrenceRetryState { attempts: 16, next_retry_at: Some(17) },
+			pay_next_automatically: true,
+			initial_start: Some(18),
+			paid_count: 19,
+			basetime: 20,
+			opaque_state,
+			last_successful_payment_id: Some(PaymentId([21; 32])),
+			attempt: Some(RecurrenceAttempt::Submitted {
+				payment_id: PaymentId([22; 32]),
+				amount_msat: 23,
+			}),
+			cancellation: RecurrenceCancellationState::Pending,
+			transition_id: 24,
+			status: RecurrenceStatus::RequiresAttention,
+		}
+	}
+
+	fn assert_state_fields(actual: &RecurrenceState, expected: &RecurrenceState) {
+		assert_eq!(actual.id, expected.id);
+		assert_eq!(actual.original_offer, expected.original_offer);
+		assert_eq!(actual.amount_msat, expected.amount_msat);
+		assert_eq!(actual.maximum_amount_msat, expected.maximum_amount_msat);
+		assert_eq!(actual.quantity, expected.quantity);
+		assert_eq!(actual.payer_note, expected.payer_note);
+		assert_eq!(
+			actual.routing_override.as_ref().map(|v| v.max_total_routing_fee_msat),
+			expected.routing_override.as_ref().map(|v| v.max_total_routing_fee_msat)
+		);
+		assert_eq!(
+			actual.routing_override.as_ref().map(|v| v.max_total_cltv_expiry_delta),
+			expected.routing_override.as_ref().map(|v| v.max_total_cltv_expiry_delta)
+		);
+		assert_eq!(
+			actual.routing_override.as_ref().map(|v| v.max_path_count),
+			expected.routing_override.as_ref().map(|v| v.max_path_count)
+		);
+		assert_eq!(
+			actual.routing_override.as_ref().map(|v| v.max_channel_saturation_power_of_half),
+			expected.routing_override.as_ref().map(|v| v.max_channel_saturation_power_of_half)
+		);
+		assert_eq!(actual.retry_policy, expected.retry_policy);
+		assert_eq!(actual.retry_state, expected.retry_state);
+		assert_eq!(actual.pay_next_automatically, expected.pay_next_automatically);
+		assert_eq!(actual.initial_start, expected.initial_start);
+		assert_eq!(actual.paid_count, expected.paid_count);
+		assert_eq!(actual.basetime, expected.basetime);
+		assert_eq!(actual.opaque_state, expected.opaque_state);
+		assert_eq!(actual.last_successful_payment_id, expected.last_successful_payment_id);
+		assert_eq!(actual.attempt, expected.attempt);
+		assert_eq!(actual.cancellation, expected.cancellation);
+		assert_eq!(actual.transition_id, expected.transition_id);
+		assert_eq!(actual.status, expected.status);
+	}
+
+	#[test]
+	fn recurrence_initial_start_preserves_protocol_optional_values() {
+		for initial_start in [None, Some(0), Some(u32::MAX)] {
+			let mut expected = state(None);
+			expected.initial_start = initial_start;
+			let actual = RecurrenceState::read(&mut &expected.encode()[..]).unwrap();
+			assert_eq!(actual.initial_start, initial_start);
+		}
+	}
+
+	#[test]
+	fn recurrence_state_round_trips_all_fields() {
+		let expected = state(Some(vec![25, 26, 27]));
+		let actual = RecurrenceState::read(&mut &expected.encode()[..]).unwrap();
+		assert_state_fields(&actual, &expected);
+	}
+
+	#[test]
+	fn recurrence_state_round_trips_without_opaque_state() {
+		let expected = state(None);
+		let actual = RecurrenceState::read(&mut &expected.encode()[..]).unwrap();
+		assert_state_fields(&actual, &expected);
+	}
+
+	#[test]
+	fn defaults_disable_automatic_recurrence() {
+		let defaults = RecurrenceState::default();
+		assert!(!defaults.pay_next_automatically);
+		assert_eq!(defaults.status, RecurrenceStatus::Active);
+		assert_eq!(defaults.cancellation, RecurrenceCancellationState::NotRequested);
+	}
+
+	#[test]
+	fn recurrence_ids_are_stable_storage_keys() {
+		let id = RecurrenceId([42; 32]);
+		let encoded = id.encode_to_hex_str();
+		assert_eq!(RecurrenceId::decode_from_hex_str(&encoded), Some(id));
+		assert_eq!(RecurrenceId::decode_from_hex_str("00"), None);
+		assert_ne!(id, RecurrenceId([43; 32]));
+	}
+
+	#[test]
+	fn recurrence_status_discriminants_are_stable() {
+		let statuses = [
+			RecurrenceStatus::Active,
+			RecurrenceStatus::CancellationPending,
+			RecurrenceStatus::Cancelled,
+			RecurrenceStatus::Completed,
+			RecurrenceStatus::Missed,
+			RecurrenceStatus::RequiresAttention,
+		];
+		let encoded: Vec<Vec<u8>> = statuses.iter().map(|status| status.encode()).collect();
+		assert_eq!(
+			encoded,
+			vec![vec![0, 0], vec![2, 0], vec![4, 0], vec![6, 0], vec![8, 0], vec![10, 0]]
+		);
+	}
+
+	#[test]
+	fn unknown_odd_tlvs_are_ignored() {
+		let mut encoded = RecurrenceStatus::Active.encode();
+		encoded.extend_from_slice(&[1, 0]);
+		assert_eq!(RecurrenceStatus::read(&mut &encoded[..]).unwrap(), RecurrenceStatus::Active);
+	}
+
+	#[test]
+	fn unknown_odd_state_tlvs_are_ignored() {
+		for opaque_len in [0, 28, 29] {
+			let expected = state(Some(vec![0; opaque_len]));
+			let mut encoded = expected.encode();
+			let mut reader = &encoded[..];
+			let BigSize(payload_len) = Readable::read(&mut reader).unwrap();
+			let payload = reader.to_vec();
+			encoded = BigSize(payload_len + 2).encode();
+			encoded.extend_from_slice(&payload);
+			encoded.extend_from_slice(&[37, 0]);
+
+			let actual = RecurrenceState::read(&mut &encoded[..]).unwrap();
+			assert_state_fields(&actual, &expected);
+		}
+	}
+
+	#[test]
+	fn recurrence_substates_round_trip_all_variants() {
+		assert_eq!(Retry::Attempts(3), Retry::read(&mut &Retry::Attempts(3).encode()[..]).unwrap());
+		assert_eq!(
+			Retry::Timeout(std::time::Duration::from_secs(4)),
+			Retry::read(&mut &Retry::Timeout(std::time::Duration::from_secs(4)).encode()[..])
+				.unwrap()
+		);
+
+		for attempt in [
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([1; 32]), amount_msat: 2 },
+			RecurrenceAttempt::Submitted { payment_id: PaymentId([3; 32]), amount_msat: 4 },
+		] {
+			assert_eq!(attempt, RecurrenceAttempt::read(&mut &attempt.encode()[..]).unwrap());
+		}
+		for cancellation in [
+			RecurrenceCancellationState::NotRequested,
+			RecurrenceCancellationState::Pending,
+			RecurrenceCancellationState::Cancelled,
+		] {
+			assert_eq!(
+				cancellation,
+				RecurrenceCancellationState::read(&mut &cancellation.encode()[..]).unwrap()
+			);
+		}
+		assert_eq!(RecurrenceCancellationState::NotRequested.encode(), vec![0, 0]);
+		assert_eq!(RecurrenceCancellationState::Pending.encode(), vec![2, 0]);
+		assert_eq!(RecurrenceCancellationState::Cancelled.encode(), vec![4, 0]);
+
+		let prepared =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([1; 32]), amount_msat: 2 };
+		let submitted =
+			RecurrenceAttempt::Submitted { payment_id: PaymentId([3; 32]), amount_msat: 4 };
+		assert_eq!(
+			prepared.encode(),
+			[vec![0, 44, 0, 32], vec![1; 32], vec![2, 8], 2u64.to_be_bytes().to_vec(),].concat()
+		);
+		assert_eq!(
+			submitted.encode(),
+			[vec![2, 44, 0, 32], vec![3; 32], vec![2, 8], 4u64.to_be_bytes().to_vec(),].concat()
+		);
+	}
+
+	#[test]
+	fn corrupted_recurrence_records_are_rejected() {
+		let encoded = state(None).encode();
+		for length in 0..encoded.len() {
+			assert!(RecurrenceState::read(&mut &encoded[..length]).is_err());
+		}
+	}
+
+	#[test]
+	fn invalid_recurrence_invariants_are_rejected() {
+		let mut invalid_states = Vec::new();
+
+		let mut invalid = state(None);
+		invalid.amount_msat = Some(0);
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.maximum_amount_msat = Some(0);
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.quantity = Some(0);
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.amount_msat = Some(8_000);
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.paid_count = 25;
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.retry_state.attempts = 0;
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.attempt =
+			Some(RecurrenceAttempt::Submitted { payment_id: PaymentId([22; 32]), amount_msat: 0 });
+		invalid_states.push(invalid);
+		let mut invalid = state(None);
+		invalid.attempt = Some(RecurrenceAttempt::Submitted {
+			payment_id: PaymentId([22; 32]),
+			amount_msat: 8_000,
+		});
+		invalid_states.push(invalid);
+		for (status, cancellation) in [
+			(RecurrenceStatus::Cancelled, RecurrenceCancellationState::Cancelled),
+			(RecurrenceStatus::Completed, RecurrenceCancellationState::NotRequested),
+			(RecurrenceStatus::Missed, RecurrenceCancellationState::NotRequested),
+		] {
+			let mut invalid = state(None);
+			invalid.status = status;
+			invalid.cancellation = cancellation;
+			invalid_states.push(invalid);
+		}
+		let mut invalid = state(None);
+		invalid.status = RecurrenceStatus::Active;
+		invalid.cancellation = RecurrenceCancellationState::Pending;
+		invalid_states.push(invalid);
+
+		for invalid in invalid_states {
+			assert!(RecurrenceState::read(&mut &invalid.encode()[..]).is_err());
+		}
+	}
+}
