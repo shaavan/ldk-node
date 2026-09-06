@@ -920,6 +920,51 @@ mod tests {
 		assert_eq!(manager.list().await.len(), 1);
 	}
 
+	#[tokio::test]
+	async fn recovery_promotes_known_attempts_and_retains_unknown_prepared() {
+		let mut known = state(None);
+		known.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([70; 32]), amount_msat: 71 });
+		let mut absent = state(None);
+		absent.id = RecurrenceId([72; 32]);
+		absent.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([73; 32]), amount_msat: 74 });
+		let (manager, _) = manager(vec![known.clone(), absent.clone()]);
+		let retry = manager
+			.reconcile_attempts(&[RecentPaymentDetails::AwaitingInvoice {
+				payment_id: PaymentId([70; 32]),
+			}])
+			.await
+			.unwrap();
+		assert_eq!(retry.len(), 1);
+		assert_eq!(retry[0].id, absent.id);
+		assert!(matches!(
+			manager.get(&known.id).await.unwrap().unwrap().attempt,
+			Some(RecurrenceAttempt::Submitted { payment_id: PaymentId([70; 32]), .. })
+		));
+		assert!(manager.is_recovery_complete());
+	}
+
+	#[tokio::test]
+	async fn recovery_treats_fulfilled_attempt_as_authoritative_success() {
+		let mut details = state(None);
+		details.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([80; 32]), amount_msat: 81 });
+		let (manager, _) = manager(vec![details.clone()]);
+		let retry = manager
+			.reconcile_attempts(&[RecentPaymentDetails::Fulfilled {
+				payment_id: PaymentId([80; 32]),
+				payment_hash: None,
+				fee_paid_msat: None,
+			}])
+			.await
+			.unwrap();
+		assert!(retry.is_empty());
+		let recovered = manager.get(&details.id).await.unwrap().unwrap();
+		assert_eq!(recovered.last_successful_payment_id, Some(PaymentId([80; 32])));
+		assert!(recovered.attempt.is_none());
+	}
+
 	#[test]
 	fn successful_payment_advances_and_replay_is_idempotent() {
 		let mut details = state(Some(vec![1, 2]));
