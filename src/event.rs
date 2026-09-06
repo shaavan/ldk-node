@@ -16,6 +16,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
 use lightning::blinded_path::message::NextMessageHop;
 use lightning::events::bump_transaction::BumpTransactionEvent;
+use lightning::events::PaidBolt12Invoice as LdkPaidBolt12Invoice;
 #[cfg(not(feature = "uniffi"))]
 use lightning::events::PaidBolt12Invoice;
 use lightning::events::{
@@ -24,7 +25,7 @@ use lightning::events::{
 };
 use lightning::ln::channelmanager::{PaymentId, TrustedChannelFeatures};
 use lightning::ln::types::ChannelId;
-use lightning::offers::offer::OfferId;
+use lightning::offers::offer::{Offer as LdkOffer, OfferId};
 use lightning::routing::gossip::NodeId;
 use lightning::sign::EntropySource;
 use lightning::util::config::{ChannelConfigOverrides, ChannelConfigUpdate};
@@ -38,6 +39,7 @@ use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use crate::config::{may_announce_channel, Config, PEER_RECONNECTION_INTERVAL};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
+use crate::data_store::StorableObjectId;
 use crate::fee_estimator::ConfirmationTarget;
 #[cfg(feature = "uniffi")]
 use crate::ffi::PaidBolt12Invoice;
@@ -49,7 +51,9 @@ use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
-use crate::payment::recurrence::RecurrenceManager;
+use crate::payment::recurrence::{
+	RecurrenceAttempt, RecurrenceManager, RecurrenceRetryState, RecurrenceStatus,
+};
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -723,6 +727,100 @@ where
 				compute_opening_fee(amount_msat, 0, max_prop_fee)
 			})
 		})
+	}
+
+	/// Completes the durable recurrence transition associated with a successful payment event.
+	///
+	/// The event is authoritative only when its payment ID matches the recorded attempt and its
+	/// invoice still belongs to the original offer. Missing or inconsistent recurrence metadata
+	/// moves the record to `RequiresAttention` instead of advancing the schedule silently.
+	async fn advance_recurrence_on_payment_sent(
+		&self, payment_id: PaymentId, bolt12_invoice: Option<&LdkPaidBolt12Invoice>,
+	) -> Result<(), ReplayEvent> {
+		let Some(mut details) =
+			self.recurrence_manager.by_payment_id(&payment_id).await.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to find recurrence for payment {}: {}",
+					payment_id,
+					e
+				);
+				ReplayEvent()
+			})?
+		else {
+			// Ordinary payments do not have recurrence state and need no extra handling.
+			return Ok(());
+		};
+
+		if matches!(
+			details.status,
+			RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+		) {
+			return Ok(());
+		}
+		if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
+			// Event replay after a completed transition must be idempotent.
+			return Ok(());
+		}
+		if !matches!(
+			&details.attempt,
+			Some(RecurrenceAttempt::Prepared { payment_id: attempt_id, .. })
+				| Some(RecurrenceAttempt::Submitted { payment_id: attempt_id, .. }) if *attempt_id == payment_id
+		) {
+			return Ok(());
+		}
+
+		let invoice = bolt12_invoice.and_then(|invoice| invoice.bolt12_invoice());
+		let Some(invoice) = invoice else {
+			// Without a parsed BOLT12 invoice, payment success cannot identify the next period.
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+			let recurrence_id = details.id.encode_to_hex_str();
+			self.recurrence_manager.update(details).await.map_err(|e| {
+				log_error!(self.logger, "Failed to record recurrence {}: {}", recurrence_id, e);
+				ReplayEvent()
+			})?;
+			return Ok(());
+		};
+
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| ReplayEvent())?;
+		if invoice.offer_id() != Some(offer.id()) {
+			// Never apply state from an invoice belonging to another offer.
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+			self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
+			return Ok(());
+		}
+		let Some(invoice_recurrence) = invoice.invoice_recurrence() else {
+			// A successful invoice without recurrence data cannot advance this schedule safely.
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+			self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
+			return Ok(());
+		};
+
+		let paid_count = details.paid_count.saturating_add(1);
+		let counter = u32::try_from(paid_count.saturating_sub(1)).unwrap_or(u32::MAX);
+		let recurrence = offer.offer_recurrence().ok_or(ReplayEvent())?;
+		let period_index =
+			recurrence.period_index(counter, details.initial_start).map_err(|_| ReplayEvent())?;
+		details.paid_count = paid_count;
+		details.basetime.get_or_insert(invoice_recurrence.recurrence_basetime());
+		details.opaque_state =
+			invoice_recurrence.recurrence_next_state().map(|state| state.to_vec());
+		details.last_successful_payment_id = Some(payment_id);
+		details.attempt = None;
+		details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+		details.transition_id += 1;
+		if recurrence.recurrence_limit.map(|limit| period_index >= limit.0).unwrap_or(false) {
+			details.status = RecurrenceStatus::Completed;
+		}
+		self.recurrence_manager.update(details).await.map_err(|e| {
+			log_error!(self.logger, "Failed to advance recurrence: {}", e);
+			ReplayEvent()
+		})?;
+		Ok(())
 	}
 
 	async fn resolve_inbound_payment_id(
@@ -1451,6 +1549,14 @@ where
 					amount_msat,
 					fee_paid_msat,
 				);
+
+				if let Err(e) = self
+					.advance_recurrence_on_payment_sent(payment_id, bolt12_invoice.as_ref())
+					.await
+				{
+					log_error!(self.logger, "Failed to advance recurrence: replaying event");
+					return Err(e);
+				}
 
 				match self.payment_store.update(update).await {
 					Ok(_) => {},
