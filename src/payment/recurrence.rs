@@ -226,7 +226,13 @@ impl RecurrenceManager {
 	/// Persists a new recurrence and indexes its known payment identifiers.
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
 		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
-		self.store.insert(details.clone()).await?;
+		let inserted = self
+			.store
+			.mutate(&details.id, |current| current.is_none().then(|| details.clone()))
+			.await?;
+		if inserted.is_none() {
+			return Err(crate::Error::PersistenceFailed);
+		}
 		self.index(&details);
 		Ok(())
 	}
@@ -751,5 +757,15 @@ mod tests {
 		let claimed = manager.get(&expected.id).await.unwrap().unwrap();
 		assert!(matches!(claimed.attempt, Some(RecurrenceAttempt::Prepared { .. })));
 		assert_eq!(claimed.transition_id, expected.transition_id + 1);
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_rejects_concurrent_duplicate_registration() {
+		let expected = state(None);
+		let (manager, _) = manager(Vec::new());
+		let (first, second) =
+			tokio::join!(manager.insert(expected.clone()), manager.insert(expected.clone()));
+		assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+		assert_eq!(manager.list().await.len(), 1);
 	}
 }
