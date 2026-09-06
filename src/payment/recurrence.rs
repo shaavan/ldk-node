@@ -211,7 +211,9 @@ pub(crate) fn record_failure(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, failure: RecurrenceFailure, now: u64,
 	closing_time: Option<u64>, retry_policy: RecurrenceRetryPolicy,
 ) {
-	if details.last_successful_payment_id == Some(payment_id) {
+	if details.last_successful_payment_id == Some(payment_id)
+		|| details.status == RecurrenceStatus::Cancelled
+	{
 		return;
 	}
 	details.attempt = None;
