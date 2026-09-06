@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
-use lightning::offers::offer::OfferId;
+use lightning::offers::offer::{Offer, OfferId};
 use lightning::routing::router::RouteParametersConfig;
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::{_init_and_read_len_prefixed_tlv_fields, write_tlv_fields};
@@ -395,6 +395,16 @@ impl RecurrenceManager {
 
 	pub(crate) fn is_recovery_complete(&self) -> bool {
 		self.recovery_complete.load(Ordering::Acquire)
+	}
+
+	/// Returns next payment-window opening for an automatically scheduled recurrence.
+	pub(crate) fn next_due_at(&self, details: &RecurrenceDetails) -> Option<u64> {
+		let basetime = details.basetime?;
+		let offer = Offer::try_from(details.original_offer.clone()).ok()?;
+		let recurrence = offer.offer_recurrence()?;
+		let counter = u32::try_from(details.paid_count).ok()?;
+		let period_index = recurrence.period_index(counter, details.initial_start).ok()?;
+		recurrence.payment_window(basetime, period_index).ok().map(|window| window.0)
 	}
 
 	/// Persists a new recurrence and indexes its known payment identifiers.
