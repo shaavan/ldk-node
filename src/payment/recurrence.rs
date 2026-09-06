@@ -71,6 +71,19 @@ pub enum RecurrenceStatus {
 	RequiresAttention,
 }
 
+impl RecurrenceStatus {
+	pub(crate) fn discriminant(self) -> u8 {
+		match self {
+			Self::Active => 0,
+			Self::CancellationPending => 2,
+			Self::Cancelled => 4,
+			Self::Completed => 6,
+			Self::Missed => 8,
+			Self::RequiresAttention => 10,
+		}
+	}
+}
+
 impl_ser_tlv_based_enum!(RecurrenceStatus,
 	(0, Active) => {},
 	(2, CancellationPending) => {},
