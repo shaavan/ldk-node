@@ -42,6 +42,68 @@ use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, Payme
 use crate::runtime::Runtime;
 use crate::types::{ChannelManager, KeysManager, PaymentStore};
 
+fn validate_recurrence_amount(
+	offer_amount_msat: Option<u64>, requested_amount_msat: Option<u64>,
+	maximum_amount_msat: Option<u64>,
+) -> Result<u64, Error> {
+	let amount_msat = requested_amount_msat.or(offer_amount_msat).ok_or(Error::InvalidAmount)?;
+	if maximum_amount_msat.is_some_and(|maximum| amount_msat > maximum) {
+		return Err(Error::InvalidAmount);
+	}
+	Ok(amount_msat)
+}
+
+#[cfg(all(test, not(feature = "uniffi")))]
+mod recurrence_tests {
+	use super::validate_recurrence_amount;
+	use lightning::offers::offer::{
+		Recurrence, RecurrenceBase, RecurrenceLimit, RecurrencePeriod, RecurrenceType,
+	};
+
+	fn recurrence(recurrence_type: RecurrenceType) -> Recurrence {
+		Recurrence {
+			recurrence_type,
+			recurrence_period: RecurrencePeriod::Days(30),
+			recurrence_paywindow: None,
+			recurrence_limit: Some(RecurrenceLimit(3)),
+		}
+	}
+
+	#[test]
+	fn validates_explicit_and_implicit_basetimes() {
+		let explicit = recurrence(RecurrenceType::Compulsory(Some(RecurrenceBase {
+			proportional: false,
+			basetime: 100,
+		})));
+		assert_eq!(explicit.period_index(0, Some(2)).unwrap(), 2);
+		assert!(explicit.period_index(0, None).is_err());
+
+		let implicit = recurrence(RecurrenceType::Compulsory(None));
+		assert_eq!(implicit.period_index(0, None).unwrap(), 0);
+		assert!(implicit.period_index(0, Some(2)).is_err());
+	}
+
+	#[test]
+	fn validates_fixed_amounts_and_maximum_ceiling() {
+		assert_eq!(validate_recurrence_amount(Some(100), None, None).unwrap(), 100);
+		assert_eq!(validate_recurrence_amount(Some(100), Some(150), Some(200)).unwrap(), 150);
+		assert!(validate_recurrence_amount(Some(100), Some(250), Some(200)).is_err());
+		assert!(validate_recurrence_amount(None, None, None).is_err());
+	}
+
+	#[test]
+	fn preserves_quantity_and_proportional_schedule_inputs() {
+		let recurrence = recurrence(RecurrenceType::Compulsory(Some(RecurrenceBase {
+			proportional: true,
+			basetime: 100,
+		})));
+		assert!(
+			matches!(recurrence.recurrence_type, RecurrenceType::Compulsory(Some(base)) if base.proportional)
+		);
+		assert_eq!(recurrence.period_index(2, Some(1)).unwrap(), 3);
+	}
+}
+
 #[cfg(not(feature = "uniffi"))]
 type Bolt12Invoice = lightning::offers::invoice::Bolt12Invoice;
 #[cfg(feature = "uniffi")]
@@ -158,20 +220,14 @@ impl Bolt12Payment {
 			Some(_) => return Err(Error::UnsupportedCurrency),
 			None => None,
 		};
-		let amount_msat = amount_msat.or(offer_amount_msat);
-		if amount_msat.is_none() || amount_msat == Some(0) {
-			return Err(Error::InvalidAmount);
-		}
-		if maximum_amount_msat == Some(0) {
+<<<<<<< HEAD
+		let amount_msat =
+			validate_recurrence_amount(offer_amount_msat, amount_msat, maximum_amount_msat)?;
+		if amount_msat == 0 || maximum_amount_msat == Some(0) {
 			return Err(Error::InvalidAmount);
 		}
 		if quantity == Some(0) {
 			return Err(Error::InvalidQuantity);
-		}
-		if let Some(maximum_amount_msat) = maximum_amount_msat {
-			if amount_msat.unwrap() > maximum_amount_msat {
-				return Err(Error::InvalidAmount);
-			}
 		}
 
 		let recurrence_id = RecurrenceId(self.keys_manager.get_secure_random_bytes());
@@ -180,7 +236,7 @@ impl Bolt12Payment {
 		let mut details = RecurrenceDetails {
 			id: recurrence_id,
 			original_offer: offer.encode(),
-			amount_msat,
+			amount_msat: Some(amount_msat),
 			maximum_amount_msat,
 			quantity,
 			payer_note: payer_note.clone().map(UntrustedString),
@@ -196,10 +252,7 @@ impl Bolt12Payment {
 			},
 			opaque_state: None,
 			last_successful_payment_id: None,
-			attempt: Some(RecurrenceAttempt::Prepared {
-				payment_id,
-				amount_msat: amount_msat.unwrap(),
-			}),
+			attempt: Some(RecurrenceAttempt::Prepared { payment_id, amount_msat }),
 			cancellation: RecurrenceCancellationState::NotRequested,
 			transition_id: 0,
 			status: RecurrenceStatus::Active,
@@ -219,7 +272,7 @@ impl Bolt12Payment {
 		let payment = PaymentDetails::new(
 			payment_id,
 			kind,
-			amount_msat,
+			Some(amount_msat),
 			None,
 			PaymentDirection::Outbound,
 			PaymentStatus::Pending,
@@ -247,7 +300,7 @@ impl Bolt12Payment {
 			.channel_manager
 			.pay_for_recurrence(
 				&offer,
-				amount_msat,
+				Some(amount_msat),
 				payment_id,
 				recurrence_id.into(),
 				params,
@@ -255,10 +308,7 @@ impl Bolt12Payment {
 			)
 			.is_ok()
 		{
-			details.attempt = Some(RecurrenceAttempt::Submitted {
-				payment_id,
-				amount_msat: amount_msat.unwrap(),
-			});
+			details.attempt = Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
 			details.transition_id += 1;
 		} else {
 			details.status = RecurrenceStatus::RequiresAttention;
