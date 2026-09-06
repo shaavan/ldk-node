@@ -838,6 +838,60 @@ impl Node {
 			}
 		});
 
+		#[cfg(not(feature = "uniffi"))]
+		{
+			// Do not schedule until startup reconciliation has classified every durable attempt.
+			let scheduler_payment = self.bolt12_payment();
+			let scheduler_manager = Arc::clone(&self.recurrence_manager);
+			let mut scheduler_stop = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				loop {
+					// Recovery may submit or complete an attempt; scheduling before it finishes could
+					// create a second payment for the same recurrence period.
+					if !scheduler_manager.is_recovery_complete() {
+						tokio::select! {
+							_ = scheduler_stop.changed() => return,
+							_ = tokio::time::sleep(Duration::from_secs(1)) => {},
+						}
+						continue;
+					}
+
+					let now =
+						SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+					let due = scheduler_manager
+						.list()
+						.await
+						.into_iter()
+						.filter(|details| {
+							details.status == crate::payment::recurrence::RecurrenceStatus::Active
+								&& details.pay_next_automatically
+								&& details.attempt.is_none()
+						})
+						.filter_map(|details| {
+							let due_at = scheduler_manager.next_due_at(&details)?;
+							Some((due_at, details.id))
+						})
+						.min_by_key(|(due_at, _)| *due_at);
+
+					let Some((due_at, recurrence_id)) = due else {
+						// Wake periodically so newly enabled or newly created recurrences are noticed.
+						tokio::select! {
+							_ = scheduler_stop.changed() => return,
+							_ = tokio::time::sleep(Duration::from_secs(60)) => {},
+						}
+						continue;
+					};
+					let delay = due_at.saturating_sub(now);
+					tokio::select! {
+						_ = scheduler_stop.changed() => return,
+						_ = tokio::time::sleep(Duration::from_secs(delay)) => {
+							let _ = scheduler_payment.pay_next_recurrence(recurrence_id);
+						},
+					}
+				}
+			});
+		}
+
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
 		Ok(())
