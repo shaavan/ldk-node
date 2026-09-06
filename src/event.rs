@@ -2551,6 +2551,18 @@ mod tests {
 	}
 
 	#[test]
+	fn recurrence_status_event_round_trips_and_preserves_transition() {
+		let event = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![7; 32],
+			status: RecurrenceStatus::CancellationPending.discriminant(),
+			transition_id: 19,
+		};
+		let encoded = event.encode();
+		let decoded = Event::read(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded, event);
+	}
+
+	#[test]
 	fn payment_sent_amount_updates_and_preserves_payment_details() {
 		let payment_id = PaymentId([1u8; 32]);
 		let payment_hash = PaymentHash([2u8; 32]);
