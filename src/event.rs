@@ -316,6 +316,10 @@ pub enum Event {
 	},
 }
 
+fn incoming_payment_cancelled_event(offer_id: OfferId, payer_signing_pubkey: PublicKey) -> Event {
+	Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey }
+}
+
 impl_ser_tlv_based_enum!(Event,
 	(0, PaymentSuccessful) => {
 		(0, payment_hash, required),
@@ -838,7 +842,7 @@ where
 					.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
 			},
 			LdkEvent::RecurringOfferCancelled { offer_id, payer_signing_pubkey } => {
-				let event = Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey };
+				let event = incoming_payment_cancelled_event(offer_id, payer_signing_pubkey);
 
 				match self.event_queue.add_event(event).await {
 					Ok(_) => {},
@@ -2308,6 +2312,62 @@ mod tests {
 			),
 			None
 		);
+	}
+
+	#[test]
+	fn recurring_offer_cancellation_is_translated_to_incoming_event() {
+		let offer_id = OfferId([42u8; 32]);
+		let payer_signing_pubkey = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+
+		assert_eq!(
+			incoming_payment_cancelled_event(offer_id, payer_signing_pubkey),
+			Event::IncomingPaymentCancelled { offer_id, payer_signing_pubkey }
+		);
+	}
+
+	#[tokio::test]
+	async fn incoming_payment_cancellation_is_serialized_and_replayed() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+		let expected_event = Event::IncomingPaymentCancelled {
+			offer_id: OfferId([23u8; 32]),
+			payer_signing_pubkey: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+		};
+
+		event_queue.add_event(expected_event.clone()).await.unwrap();
+
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let replayed_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), Arc::clone(&logger)))
+				.unwrap();
+		assert_eq!(replayed_queue.next_event(), Some(expected_event.clone()));
+
+		event_queue.event_handled().await.unwrap();
+		let persisted_bytes = KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		.unwrap();
+		let replayed_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger));
+		assert_eq!(replayed_queue.unwrap().next_event(), None);
 	}
 
 	#[tokio::test]
