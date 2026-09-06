@@ -318,6 +318,119 @@ impl Bolt12Payment {
 		Ok((recurrence_id, payment_id))
 	}
 
+	/// Submits the next sequential payment for an active recurring offer.
+	///
+	/// Once the attempt is durably recorded, the returned [`PaymentId`] remains valid even when
+	/// synchronous submission fails; inspect the recurrence and payment records for that result.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		let Some(mut details) = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+		else {
+			return Err(Error::InvalidOfferId);
+		};
+		if details.status != RecurrenceStatus::Active || details.paid_count == 0 {
+			return Err(Error::InvalidOffer);
+		}
+		if details.attempt.is_some() {
+			return Err(Error::PaymentSendingFailed);
+		}
+		let counter = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+		let period_index = recurrence
+			.period_index(counter, details.initial_start)
+			.map_err(|_| Error::InvalidOffer)?;
+		if recurrence.recurrence_limit.map(|limit| period_index > limit.0).unwrap_or(false) {
+			return Err(Error::InvalidOffer);
+		}
+		let basetime = details.basetime.ok_or(Error::InvalidOffer)?;
+		let (opening, closing) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		if now < opening {
+			return Err(Error::InvalidOffer);
+		}
+		if now >= closing {
+			details.status = RecurrenceStatus::Missed;
+			details.transition_id += 1;
+			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			return Err(Error::InvalidOffer);
+		}
+		let amount_msat = details.amount_msat.ok_or(Error::InvalidAmount)?;
+		let payment_id = PaymentId(self.keys_manager.get_secure_random_bytes());
+		let retry_policy = details.retry_policy;
+		details = self
+			.runtime
+			.block_on(self.recurrence_manager.claim_attempt(
+				&recurrence_id,
+				RecurrenceAttempt::Prepared { payment_id, amount_msat },
+			))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::PaymentSendingFailed)?;
+		let payment = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Bolt12Offer {
+				hash: None,
+				preimage: None,
+				secret: None,
+				offer_id: offer.id(),
+				payer_note: details.payer_note.clone(),
+				quantity: details.quantity,
+			},
+			Some(amount_msat),
+			None,
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
+			details.status = RecurrenceStatus::RequiresAttention;
+			details.transition_id += 1;
+			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			return Ok(payment_id);
+		}
+		let optional_params = OptionalOfferPaymentParams {
+			payer_note: details.payer_note.as_ref().map(ToString::to_string),
+			route_params_config: details
+				.routing_override
+				.or(self.config.route_parameters)
+				.unwrap_or_default(),
+			retry_strategy: retry_policy,
+		};
+		let params = lightning::ln::channelmanager::RecurrencePaymentParams {
+			counter,
+			start: details.initial_start,
+			prev_state: details.opaque_state.clone(),
+			quantity: details.quantity,
+			expected_invoice_recurrence_basetime: details.basetime,
+		};
+		if self
+			.channel_manager
+			.pay_for_recurrence(
+				&offer,
+				details.amount_msat,
+				payment_id,
+				recurrence_id.into(),
+				params,
+				optional_params,
+			)
+			.is_ok()
+		{
+			details.attempt = Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+		} else {
+			details.status = RecurrenceStatus::RequiresAttention;
+		}
+		details.transition_id += 1;
+		let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+		Ok(payment_id)
+	}
+
 	pub(crate) fn send_using_amount_inner(
 		&self, offer: &Offer, amount_msat: u64, quantity: Option<u64>, payer_note: Option<String>,
 		route_parameters: Option<RouteParametersConfig>, hrn: Option<HumanReadableName>,
