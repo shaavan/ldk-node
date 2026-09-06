@@ -241,6 +241,9 @@ impl Bolt12Payment {
 			payer_note: payer_note.clone().map(UntrustedString),
 			routing_override: route_parameters,
 			retry_policy,
+			recurrence_retry_policy: Some(
+				crate::payment::recurrence::RecurrenceRetryPolicy::default(),
+			),
 			retry_state: RecurrenceRetryState { attempts: 0, next_retry_at: None },
 			pay_next_automatically: false,
 			initial_start,
@@ -420,7 +423,7 @@ impl Bolt12Payment {
 		else {
 			return Err(Error::InvalidOfferId);
 		};
-		if details.status != RecurrenceStatus::Active || details.paid_count == 0 {
+		if details.status != RecurrenceStatus::Active {
 			return Err(Error::InvalidOffer);
 		}
 		if details.attempt.is_some() {
@@ -440,6 +443,9 @@ impl Bolt12Payment {
 		let (opening, closing) =
 			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		if details.retry_state.next_retry_at.is_some_and(|retry_at| now < retry_at) {
+			return Err(Error::PaymentSendingFailed);
+		}
 		if now < opening {
 			return Err(Error::InvalidOffer);
 		}
