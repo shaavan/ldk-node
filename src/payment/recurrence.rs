@@ -1005,7 +1005,7 @@ mod tests {
 		assert_eq!(retry[0].id, absent.id);
 		assert!(matches!(
 			manager.get(&known.id).await.unwrap().unwrap().attempt,
-			Some(RecurrenceAttempt::Submitted { payment_id: PaymentId([70; 32]), .. })
+			Some(RecurrenceAttempt::Submitted { payment_id, .. }) if payment_id == PaymentId([70; 32])
 		));
 		assert!(manager.is_recovery_complete());
 	}
@@ -1171,5 +1171,36 @@ mod tests {
 		assert!(1_100 < 1_200);
 		assert!(1_200 >= 1_200);
 		assert!(recurrence.period_index(3, None).unwrap() > recurrence.recurrence_limit.unwrap().0);
+	}
+
+	#[test]
+	fn automatic_policy_defaults_off_and_route_override_can_be_cleared() {
+		let mut details = RecurrenceState::default();
+		assert!(!details.pay_next_automatically);
+		details.pay_next_automatically = true;
+		details.routing_override = Some(RouteParametersConfig {
+			max_total_routing_fee_msat: Some(10),
+			max_total_cltv_expiry_delta: 144,
+			max_path_count: 1,
+			max_channel_saturation_power_of_half: 14,
+		});
+		details.routing_override = None;
+		assert!(details.pay_next_automatically);
+		assert!(details.routing_override.is_none());
+	}
+
+	#[test]
+	fn scheduler_ignores_records_without_a_recoverable_due_time() {
+		let manager = manager(Vec::new()).0;
+		let details = state(None);
+		assert_eq!(manager.next_due_at(&details), None);
+	}
+
+	#[test]
+	fn ldk_calendar_helpers_cover_seconds_days_months_and_month_end() {
+		assert_eq!(RecurrencePeriod::Seconds(60).start_time(100, 2), Ok(220));
+		assert_eq!(RecurrencePeriod::Days(1).start_time(86_400, 2), Ok(259_200));
+		assert_eq!(RecurrencePeriod::Months(1).start_time(1_706_742_800, 1), Ok(1_709_248_400));
+		assert_eq!(RecurrencePeriod::Months(1).start_time(1_709_251_200, 1), Ok(1_711_929_600));
 	}
 }
