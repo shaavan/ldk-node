@@ -5,6 +5,9 @@
 // http://opensource.org/licenses/MIT>. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
@@ -15,8 +18,9 @@ use lightning::{_init_and_read_len_prefixed_tlv_fields, write_tlv_fields};
 use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_types::string::UntrustedString;
 
-use crate::data_store::StorableObjectId;
+use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
+use crate::types::RecurrenceStore;
 
 /// A stable identifier for a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -132,6 +136,143 @@ pub(crate) struct RecurrenceState {
 	pub cancellation: RecurrenceCancellationState,
 	pub transition_id: u64,
 	pub status: RecurrenceStatus,
+}
+
+pub(crate) type RecurrenceDetails = RecurrenceState;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecurrenceDetailsUpdate {
+	pub details: RecurrenceDetails,
+}
+
+impl StorableObject for RecurrenceDetails {
+	type Id = RecurrenceId;
+	type Update = RecurrenceDetailsUpdate;
+
+	fn id(&self) -> Self::Id {
+		self.id
+	}
+
+	fn update(&mut self, update: Self::Update) -> bool {
+		if self.id != update.details.id {
+			return false;
+		}
+		*self = update.details;
+		true
+	}
+
+	fn to_update(&self) -> Self::Update {
+		RecurrenceDetailsUpdate { details: self.clone() }
+	}
+}
+
+impl StorableObjectUpdate<RecurrenceDetails> for RecurrenceDetailsUpdate {
+	fn id(&self) -> RecurrenceId {
+		self.details.id
+	}
+}
+
+/// Coordinates durable recurrence records and the in-memory payment index.
+pub(crate) struct RecurrenceManager {
+	store: Arc<RecurrenceStore>,
+	payment_index: Mutex<HashMap<PaymentId, RecurrenceId>>,
+}
+
+impl RecurrenceManager {
+	pub(crate) fn new(store: Arc<RecurrenceStore>) -> Self {
+		Self { store, payment_index: Mutex::new(HashMap::new()) }
+	}
+
+	pub(crate) fn store(&self) -> &Arc<RecurrenceStore> {
+		&self.store
+	}
+
+	pub(crate) async fn rebuild_index(&self) {
+		let details = self.list().await;
+		let mut index = self.payment_index.lock().expect("lock");
+		index.clear();
+		for details in details {
+			if let Some(payment_id) = details.last_successful_payment_id {
+				index.insert(payment_id, details.id);
+			}
+			if let Some(
+				RecurrenceAttempt::Prepared { payment_id, .. }
+				| RecurrenceAttempt::Submitted { payment_id, .. },
+			) = details.attempt
+			{
+				index.insert(payment_id, details.id);
+			}
+		}
+	}
+
+	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
+		self.store.insert(details.clone()).await?;
+		self.index(&details);
+		Ok(())
+	}
+
+	pub(crate) async fn get(
+		&self, id: &RecurrenceId,
+	) -> Result<Option<RecurrenceDetails>, crate::Error> {
+		self.store.get(id).await
+	}
+
+	pub(crate) async fn update(
+		&self, details: RecurrenceDetails,
+	) -> Result<crate::data_store::DataStoreUpdateResult, crate::Error> {
+		let result = self.store.update(details.to_update()).await?;
+		self.index(&details);
+		Ok(result)
+	}
+
+	pub(crate) async fn remove(&self, id: &RecurrenceId) -> Result<(), crate::Error> {
+		self.store.remove(id).await?;
+		self.payment_index.lock().expect("lock").retain(|_, recurrence_id| recurrence_id != id);
+		Ok(())
+	}
+
+	pub(crate) async fn list(&self) -> Vec<RecurrenceDetails> {
+		self.store.list_filter(|_| true).await
+	}
+
+	pub(crate) async fn by_payment_id(
+		&self, payment_id: &PaymentId,
+	) -> Result<Option<RecurrenceDetails>, crate::Error> {
+		let cached_id = self.payment_index.lock().expect("lock").get(payment_id).copied();
+		if let Some(id) = cached_id {
+			if let Some(details) = self.store.get(&id).await? {
+				return Ok(Some(details));
+			}
+		}
+
+		let details = self
+			.store
+			.list_filter(|details| {
+				details.last_successful_payment_id.as_ref() == Some(payment_id)
+					|| matches!(&details.attempt, Some(RecurrenceAttempt::Prepared { payment_id: id, .. } | RecurrenceAttempt::Submitted { payment_id: id, .. }) if id == payment_id)
+			})
+			.await
+			.into_iter()
+			.next();
+		if let Some(details) = &details {
+			self.index(details);
+		}
+		Ok(details)
+	}
+
+	fn index(&self, details: &RecurrenceDetails) {
+		let mut index = self.payment_index.lock().expect("lock");
+		if let Some(payment_id) = details.last_successful_payment_id {
+			index.insert(payment_id, details.id);
+		}
+		if let Some(
+			RecurrenceAttempt::Prepared { payment_id, .. }
+			| RecurrenceAttempt::Submitted { payment_id, .. },
+		) = details.attempt
+		{
+			index.insert(payment_id, details.id);
+		}
+	}
 }
 
 impl Default for RecurrenceState {
