@@ -145,10 +145,29 @@ impl From<&PendingPaymentDetails> for PendingPaymentDetailsUpdate {
 #[cfg(test)]
 mod tests {
 	use bitcoin::hashes::Hash;
+	use lightning::util::ser::Readable;
 
 	use super::*;
+	use crate::hex_utils;
 	use crate::payment::store::ConfirmationStatus;
 	use crate::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+
+	#[test]
+	/// Verify that funding candidates written with the pre-migration layout remain readable.
+	fn funding_candidate_reads_legacy_layout_fixture() {
+		let candidate = FundingTxCandidate {
+			txid: Txid::from_byte_array([9; 32]),
+			amount_msat: Some(50_000),
+			fee_paid_msat: Some(500),
+		};
+		let fixture = hex_utils::to_vec(
+			"36002009090909090909090909090909090909090909090909090909090909090909090208000000000000c350040800000000000001f4",
+		)
+		.unwrap();
+		let decoded = FundingTxCandidate::read(&mut &fixture[..]).unwrap();
+
+		assert_eq!(decoded, candidate);
+	}
 
 	#[test]
 	fn pending_payment_candidate_lookup() {
