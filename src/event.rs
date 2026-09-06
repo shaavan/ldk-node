@@ -10,6 +10,7 @@ use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
@@ -51,7 +52,9 @@ use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
-use crate::payment::recurrence::{record_success, RecurrenceManager, RecurrenceStatus};
+use crate::payment::recurrence::{
+	record_failure, record_success, RecurrenceFailure, RecurrenceManager, RecurrenceStatus,
+};
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -791,6 +794,41 @@ where
 			log_error!(self.logger, "Failed to advance recurrence: {}", e);
 			ReplayEvent()
 		})?;
+		Ok(())
+	}
+
+	async fn record_recurrence_failure(
+		&self, payment_id: PaymentId, reason: Option<PaymentFailureReason>,
+	) -> Result<(), ReplayEvent> {
+		let Some(mut details) =
+			self.recurrence_manager.by_payment_id(&payment_id).await.map_err(|_| ReplayEvent())?
+		else {
+			return Ok(());
+		};
+		let failure = match reason {
+			Some(
+				PaymentFailureReason::PaymentExpired | PaymentFailureReason::InvoiceRequestExpired,
+			) => RecurrenceFailure::Expired,
+			Some(
+				PaymentFailureReason::RecipientRejected
+				| PaymentFailureReason::InvoiceRequestRejected,
+			) => RecurrenceFailure::Rejected,
+			Some(PaymentFailureReason::RouteNotFound | PaymentFailureReason::RetriesExhausted) => {
+				RecurrenceFailure::RouteFailed
+			},
+			Some(PaymentFailureReason::UserAbandoned) => RecurrenceFailure::Abandoned,
+			_ => RecurrenceFailure::Unknown,
+		};
+		let closing_time = details.basetime.and_then(|basetime| {
+			let offer = LdkOffer::try_from(details.original_offer.clone()).ok()?;
+			let recurrence = offer.offer_recurrence()?;
+			let counter = u32::try_from(details.paid_count).ok()?;
+			let period = recurrence.period_index(counter, details.initial_start).ok()?;
+			recurrence.payment_window(basetime, period).ok().map(|(_, closing)| closing)
+		});
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		record_failure(&mut details, payment_id, failure, now, closing_time);
+		self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
 		Ok(())
 	}
 
@@ -1593,9 +1631,17 @@ where
 					reason
 				);
 
+				self.record_recurrence_failure(payment_id, reason).await?;
+				let payment_succeeded = self
+					.payment_store
+					.get(&payment_id)
+					.await
+					.map_err(|_| ReplayEvent())?
+					.map(|payment| payment.status == PaymentStatus::Succeeded)
+					.unwrap_or(false);
 				let update = PaymentDetailsUpdate {
-					hash: Some(payment_hash),
-					status: Some(PaymentStatus::Failed),
+					hash: (!payment_succeeded).then_some(payment_hash),
+					status: (!payment_succeeded).then_some(PaymentStatus::Failed),
 					..PaymentDetailsUpdate::new(payment_id)
 				};
 				match self.payment_store.update(update).await {

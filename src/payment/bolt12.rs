@@ -247,6 +247,7 @@ impl Bolt12Payment {
 			last_successful_payment_id: None,
 			attempt: Some(RecurrenceAttempt::Prepared { payment_id, amount_msat }),
 			cancellation: RecurrenceCancellationState::NotRequested,
+			failure: None,
 			transition_id: 0,
 			status: RecurrenceStatus::Active,
 		};
