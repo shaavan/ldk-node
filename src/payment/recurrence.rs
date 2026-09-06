@@ -920,6 +920,31 @@ mod tests {
 		assert_eq!(manager.list().await.len(), 1);
 	}
 
+	#[tokio::test]
+	async fn recovery_promotes_known_attempts_and_retains_unknown_prepared() {
+		let mut known = state(None);
+		known.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([70; 32]), amount_msat: 71 });
+		let mut absent = state(None);
+		absent.id = RecurrenceId([72; 32]);
+		absent.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([73; 32]), amount_msat: 74 });
+		let (manager, _) = manager(vec![known.clone(), absent.clone()]);
+		let retry = manager
+			.reconcile_attempts(&[RecentPaymentDetails::AwaitingInvoice {
+				payment_id: PaymentId([70; 32]),
+			}])
+			.await
+			.unwrap();
+		assert_eq!(retry.len(), 1);
+		assert_eq!(retry[0].id, absent.id);
+		assert!(matches!(
+			manager.get(&known.id).await.unwrap().unwrap().attempt,
+			Some(RecurrenceAttempt::Submitted { payment_id: PaymentId([70; 32]), .. })
+		));
+		assert!(manager.is_recovery_complete());
+	}
+
 	#[test]
 	fn successful_payment_advances_and_replay_is_idempotent() {
 		let mut details = state(Some(vec![1, 2]));
