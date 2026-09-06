@@ -175,6 +175,15 @@ pub enum Event {
 		/// The payer signing pubkey used for this recurrence.
 		payer_signing_pubkey: PublicKey,
 	},
+	/// The durable status of a recurrence changed.
+	RecurrenceStatusChanged {
+		/// The stable recurrence identifier, encoded as 32 bytes.
+		recurrence_id: Vec<u8>,
+		/// The status discriminant of the recurrence.
+		status: u8,
+		/// The monotonic recurrence transition identifier.
+		transition_id: u64,
+	},
 	/// A payment has been forwarded.
 	PaymentForwarded {
 		/// The set of incoming HTLCs that were forwarded to our node. Contains a single HTLC for
@@ -348,6 +357,11 @@ impl_ser_tlv_based_enum!(Event,
 	(10, IncomingPaymentCancelled) => {
 		(0, offer_id, required),
 		(1, payer_signing_pubkey, required),
+	},
+	(11, RecurrenceStatusChanged) => {
+		(0, recurrence_id, required),
+		(1, status, required),
+		(2, transition_id, required),
 	},
 	(3, ChannelReady) => {
 		(0, channel_id, required),
@@ -700,6 +714,30 @@ where
 		});
 	}
 
+	/// Queues one durable lifecycle event when a recurrence status actually changes.
+	///
+	/// The transition ID is emitted with the status so consumers can distinguish replay of an old
+	/// event from a later transition that happens to use the same status value.
+	async fn emit_recurrence_status_change(
+		&self, previous_status: RecurrenceStatus,
+		details: &crate::payment::recurrence::RecurrenceDetails,
+	) -> Result<(), ReplayEvent> {
+		if previous_status == details.status {
+			return Ok(());
+		}
+		self.event_queue
+			.add_event(Event::RecurrenceStatusChanged {
+				recurrence_id: details.id.0.to_vec(),
+				status: details.status.discriminant(),
+				transition_id: details.transition_id,
+			})
+			.await
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to queue recurrence status change: {}", e);
+				ReplayEvent()
+			})
+	}
+
 	async fn fail_claimable_payment(
 		&self, payment_id: PaymentId, payment_hash: &PaymentHash,
 	) -> Result<(), ReplayEvent> {
@@ -752,6 +790,7 @@ where
 			// Ordinary payments do not have recurrence state and need no extra handling.
 			return Ok(());
 		};
+		let previous_status = details.status;
 
 		if matches!(
 			details.status,
@@ -777,10 +816,11 @@ where
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
 			let recurrence_id = details.id.encode_to_hex_str();
-			self.recurrence_manager.update(details).await.map_err(|e| {
+			self.recurrence_manager.update(details.clone()).await.map_err(|e| {
 				log_error!(self.logger, "Failed to record recurrence {}: {}", recurrence_id, e);
 				ReplayEvent()
 			})?;
+			self.emit_recurrence_status_change(previous_status, &details).await?;
 			return Ok(());
 		};
 
@@ -790,14 +830,16 @@ where
 			// Never apply state from an invoice belonging to another offer.
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
-			self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
+			self.recurrence_manager.update(details.clone()).await.map_err(|_| ReplayEvent())?;
+			self.emit_recurrence_status_change(previous_status, &details).await?;
 			return Ok(());
 		}
 		let Some(invoice_recurrence) = invoice.invoice_recurrence() else {
 			// A successful invoice without recurrence data cannot advance this schedule safely.
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
-			self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
+			self.recurrence_manager.update(details.clone()).await.map_err(|_| ReplayEvent())?;
+			self.emit_recurrence_status_change(previous_status, &details).await?;
 			return Ok(());
 		};
 
@@ -813,10 +855,11 @@ where
 			period_index,
 			recurrence.recurrence_limit.map(|limit| limit.0),
 		);
-		self.recurrence_manager.update(details).await.map_err(|e| {
+		self.recurrence_manager.update(details.clone()).await.map_err(|e| {
 			log_error!(self.logger, "Failed to advance recurrence: {}", e);
 			ReplayEvent()
 		})?;
+		self.emit_recurrence_status_change(previous_status, &details).await?;
 		Ok(())
 	}
 
@@ -832,6 +875,7 @@ where
 		else {
 			return Ok(());
 		};
+		let previous_status = details.status;
 		let failure = match reason {
 			Some(
 				PaymentFailureReason::PaymentExpired | PaymentFailureReason::InvoiceRequestExpired,
@@ -856,7 +900,8 @@ where
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 		let retry_policy = details.recurrence_retry_policy.unwrap_or_default();
 		record_failure(&mut details, payment_id, failure, now, closing_time, retry_policy);
-		self.recurrence_manager.update(details).await.map_err(|_| ReplayEvent())?;
+		self.recurrence_manager.update(details.clone()).await.map_err(|_| ReplayEvent())?;
+		self.emit_recurrence_status_change(previous_status, &details).await?;
 		Ok(())
 	}
 
