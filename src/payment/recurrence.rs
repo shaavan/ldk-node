@@ -388,6 +388,21 @@ impl RecurrenceManager {
 		self.recovery_complete.load(Ordering::Acquire)
 	}
 
+	/// Returns next payment-window opening for an automatically scheduled recurrence.
+	pub(crate) fn next_due_at(&self, details: &RecurrenceDetails) -> Option<u64> {
+		let basetime = details.basetime?;
+		let offer = Offer::try_from(details.original_offer.clone()).ok()?;
+		let recurrence = offer.offer_recurrence()?;
+		let counter = u32::try_from(details.paid_count).ok()?;
+		let period_index = recurrence.period_index(counter, details.initial_start).ok()?;
+		recurrence.payment_window(basetime, period_index).ok().map(|window| window.0)
+	}
+
+	/// Delays scheduler wake-up until both the payment window and retry backoff allow a payment.
+	pub(crate) fn next_recurrence_wake_at(window_open: u64, retry_at: Option<u64>) -> u64 {
+		window_open.max(retry_at.unwrap_or_default())
+	}
+
 	/// Persists a new recurrence and indexes its known payment identifiers.
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
 		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
@@ -1189,5 +1204,137 @@ mod tests {
 		assert!(1_100 < 1_200);
 		assert!(1_200 >= 1_200);
 		assert!(recurrence.period_index(3, None).unwrap() > recurrence.recurrence_limit.unwrap().0);
+	}
+
+	#[test]
+	fn automatic_policy_defaults_off_and_route_override_can_be_cleared() {
+		let mut details = RecurrenceState::default();
+		assert!(!details.pay_next_automatically);
+		details.pay_next_automatically = true;
+		details.routing_override = Some(RouteParametersConfig {
+			max_total_routing_fee_msat: Some(10),
+			max_total_cltv_expiry_delta: 144,
+			max_path_count: 1,
+			max_channel_saturation_power_of_half: 14,
+		});
+		details.routing_override = None;
+		assert!(details.pay_next_automatically);
+		assert!(details.routing_override.is_none());
+	}
+
+	#[test]
+	fn scheduler_ignores_records_without_a_recoverable_due_time() {
+		let manager = manager(Vec::new()).0;
+		let details = state(None);
+		assert_eq!(manager.next_due_at(&details), None);
+	}
+
+	#[test]
+	fn scheduler_wake_waits_for_retry_backoff() {
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, None), 100);
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, Some(90)), 100);
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, Some(120)), 120);
+	}
+
+	#[test]
+	fn ldk_calendar_helpers_cover_seconds_days_months_and_month_end() {
+		assert_eq!(RecurrencePeriod::Seconds(60).start_time(100, 2), Ok(220));
+		assert_eq!(RecurrencePeriod::Days(1).start_time(86_400, 2), Ok(259_200));
+		assert_eq!(RecurrencePeriod::Months(1).start_time(1_706_742_800, 1), Ok(1_709_248_400));
+		assert_eq!(RecurrencePeriod::Months(1).start_time(1_709_251_200, 1), Ok(1_711_929_600));
+	}
+
+	#[test]
+	fn recurrence_retry_policy_uses_bounded_exponential_backoff() {
+		assert_eq!(recurrence_retry_delay(1), 5);
+		assert_eq!(recurrence_retry_delay(2), 10);
+		assert_eq!(recurrence_retry_delay(3), 20);
+		assert_eq!(recurrence_retry_delay(10), 300);
+		let policy = RecurrenceRetryPolicy::default();
+		assert_eq!(policy.max_retries, 3);
+		assert_eq!(policy, RecurrenceRetryPolicy::read(&mut &policy.encode()[..]).unwrap());
+	}
+
+	#[test]
+	fn recurrence_retry_limit_and_window_are_persisted() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		details.recurrence_retry_policy = Some(RecurrenceRetryPolicy { max_retries: 1 });
+		details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+		let retry_policy = details.recurrence_retry_policy.unwrap();
+		record_failure(
+			&mut details,
+			PaymentId([80; 32]),
+			RecurrenceFailure::RouteFailed,
+			100,
+			Some(200),
+			retry_policy,
+		);
+		assert_eq!(details.retry_state.attempts, 1);
+		assert_eq!(details.retry_state.next_retry_at, Some(105));
+		record_failure(
+			&mut details,
+			PaymentId([81; 32]),
+			RecurrenceFailure::RouteFailed,
+			110,
+			Some(200),
+			retry_policy,
+		);
+		assert_eq!(details.retry_state.next_retry_at, None);
+		assert_eq!(details.status, RecurrenceStatus::RequiresAttention);
+	}
+
+	#[test]
+	fn recurrence_config_defaults_to_manual_payment_and_three_retries() {
+		let config = RecurrenceConfig::default();
+		assert!(!config.pay_next_automatically);
+		assert_eq!(config.retry_policy, RecurrenceRetryPolicy { max_retries: 3 });
+		assert!(config.amount_msat.is_none());
+		assert!(config.maximum_amount_msat.is_none());
+		assert!(config.quantity.is_none());
+		assert!(config.payer_note.is_none());
+		assert!(config.routing_override.is_none());
+		assert!(config.initial_start.is_none());
+	}
+
+	#[test]
+	fn recurrence_id_has_stable_hex_representation_for_ffi() {
+		let id = RecurrenceId([0xab; 32]);
+		let encoded = id.encode_to_hex_str();
+		assert_eq!(encoded.len(), 64);
+		assert_eq!(RecurrenceId::decode_from_hex_str(&encoded), Some(id));
+		assert!(RecurrenceId::decode_from_hex_str("not-a-recurrence-id").is_none());
+	}
+
+	#[test]
+	fn recurrence_manager_removes_record_and_index_entries() {
+		let expected = state(None);
+		let (manager, _) = manager(Vec::new());
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		runtime.block_on(manager.insert(expected.clone())).unwrap();
+		assert_eq!(runtime.block_on(manager.list()).len(), 1);
+		assert!(runtime
+			.block_on(manager.by_payment_id(&expected.last_successful_payment_id.unwrap()))
+			.unwrap()
+			.is_some());
+
+		runtime.block_on(manager.remove(&expected.id)).unwrap();
+		assert!(runtime.block_on(manager.get(&expected.id)).unwrap().is_none());
+		assert!(runtime
+			.block_on(manager.by_payment_id(&expected.last_successful_payment_id.unwrap()))
+			.unwrap()
+			.is_none());
+	}
+
+	#[test]
+	fn cancellation_state_is_terminal_and_late_success_does_not_resume() {
+		let mut details = state(Some(vec![9, 9]));
+		details.status = RecurrenceStatus::Cancelled;
+		details.cancellation = RecurrenceCancellationState::Cancelled;
+		details.paid_count = 1;
+		record_success(&mut details, PaymentId([90; 32]), 100, Some(&[1]), 1, None);
+		assert_eq!(details.status, RecurrenceStatus::Cancelled);
+		assert_eq!(details.cancellation, RecurrenceCancellationState::Cancelled);
+		assert_eq!(details.paid_count, 2);
 	}
 }
