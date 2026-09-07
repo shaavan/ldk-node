@@ -31,6 +31,14 @@
   `Event::PaymentClaimable`.
 
 ## Feature and API updates
+- Recurring BOLT 12 payments expose durable recurrence identifiers, recurrence configuration,
+  payment-window inspection, manual next-period submission, cancellation, and terminal-record
+  removal through Rust and UniFFI. The returned payment identifier refers to the individual
+  attempt, while the recurrence identifier refers to the long-lived relationship. Automatic
+  payment is disabled by default; enabling it affects future periods only. A requested amount
+  must satisfy the offer's amount rules and any configured maximum ceiling. Routing parameters
+  may be overridden per recurrence, and clearing the override restores node-wide routing
+  configuration.
 - Language-binding `Mnemonic` objects can be generated or constructed from entropy and expose
   their words, word indices, word count, entropy, checksum, and passphrase-derived seed.
 - `Node::list_payments` is now paginated: it takes an optional `PageToken` and returns a
