@@ -2563,6 +2563,23 @@ mod tests {
 	}
 
 	#[test]
+	fn recurrence_status_event_replay_identity_uses_transition_id() {
+		let first = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 4,
+		};
+		let replay = Event::read(&mut &first.encode()[..]).unwrap();
+		let later = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 5,
+		};
+		assert_eq!(replay, first);
+		assert_ne!(first, later);
+	}
+
+	#[test]
 	fn payment_sent_amount_updates_and_preserves_payment_details() {
 		let payment_id = PaymentId([1u8; 32]);
 		let payment_hash = PaymentHash([2u8; 32]);
@@ -2671,10 +2688,16 @@ mod tests {
 	}
 
 	#[tokio::test]
+	/// Verify that an incoming cancellation event survives persistence and replay, and that
+	/// acknowledging the event removes it from the persisted queue.
+	///
+	/// Replay must return the exact event, including its offer ID and payer signing key. Handling
+	/// it must persist an empty queue so a restart cannot deliver the same event again.
 	async fn incoming_payment_cancellation_is_serialized_and_replayed() {
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
 		let logger = Arc::new(TestLogger::new());
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+		// Fixed values make it possible to verify that serialization preserves both event fields.
 		let expected_event = Event::IncomingPaymentCancelled {
 			offer_id: OfferId([23u8; 32]),
 			payer_signing_pubkey: PublicKey::from_str(
@@ -2683,8 +2706,10 @@ mod tests {
 			.unwrap(),
 		};
 
+		// Enqueuing persists the event before the application handles it.
 		event_queue.add_event(expected_event.clone()).await.unwrap();
 
+		// Recreate the queue from storage, matching what happens when the node starts again.
 		let persisted_bytes = KVStore::read(
 			&*store,
 			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -2698,6 +2723,7 @@ mod tests {
 				.unwrap();
 		assert_eq!(replayed_queue.next_event(), Some(expected_event.clone()));
 
+		// Acknowledging the event persists its removal.
 		event_queue.event_handled().await.unwrap();
 		let persisted_bytes = KVStore::read(
 			&*store,
