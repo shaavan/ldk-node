@@ -2521,6 +2521,23 @@ mod tests {
 		let decoded = Event::read(&mut &encoded[..]).unwrap();
 		assert_eq!(decoded, event);
 	}
+
+	#[test]
+	fn recurrence_status_event_replay_identity_uses_transition_id() {
+		let first = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 4,
+		};
+		let replay = Event::read(&mut &first.encode()[..]).unwrap();
+		let later = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 5,
+		};
+		assert_eq!(replay, first);
+		assert_ne!(first, later);
+	}
 	#[tokio::test]
 	/// Verify that an incoming cancellation event survives persistence and replay, and that
 	/// acknowledging the event removes it from the persisted queue.
