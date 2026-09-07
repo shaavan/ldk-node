@@ -36,6 +36,7 @@ impl StorableObjectId for RecurrenceId {
 
 /// The lifecycle status of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RecurrenceStatus {
 	/// Recurrence can accept its next payment attempt.
 	Active,
@@ -88,6 +89,7 @@ impl_ser_tlv_based!(RecurrenceRetryState, {
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrenceRetryPolicy {
 	/// Maximum number of recurrence-level retries for one payment window.
 	pub max_retries: u32,
@@ -218,6 +220,7 @@ pub type RecurrenceDetails = RecurrenceState;
 
 #[derive(Clone, Debug)]
 /// Configuration used when starting a recurring payment.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrenceConfig {
 	/// Requested amount, falling back to the offer amount when omitted.
 	pub amount_msat: Option<u64>,
@@ -253,6 +256,7 @@ impl Default for RecurrenceConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrencePaymentWindow {
 	/// Period represented by this window.
 	pub period_index: u32,
