@@ -2532,6 +2532,23 @@ mod tests {
 	}
 
 	#[test]
+	fn recurrence_status_event_replay_identity_uses_transition_id() {
+		let first = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 4,
+		};
+		let replay = Event::read(&mut &first.encode()[..]).unwrap();
+		let later = Event::RecurrenceStatusChanged {
+			recurrence_id: vec![8; 32],
+			status: RecurrenceStatus::Active.discriminant(),
+			transition_id: 5,
+		};
+		assert_eq!(replay, first);
+		assert_ne!(first, later);
+	}
+
+	#[test]
 	fn payment_sent_amount_updates_and_preserves_payment_details() {
 		let payment_id = PaymentId([1u8; 32]);
 		let payment_hash = PaymentHash([2u8; 32]);
