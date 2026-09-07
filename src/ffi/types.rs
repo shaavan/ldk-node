@@ -159,6 +159,7 @@ pub use crate::config::default_config;
 use crate::error::Error;
 pub use crate::liquidity::LSPS1OrderStatus;
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
+use crate::payment::recurrence::RecurrenceId;
 pub use crate::probing::ProbingConfig;
 use crate::{hex_utils, SocketAddress, UserChannelId};
 
@@ -1059,6 +1060,91 @@ uniffi::custom_type!(PaymentId, String, {
 		hex_utils::to_string(&obj.0)
 	},
 });
+
+uniffi::custom_type!(RecurrenceId, String, {
+	remote,
+	try_lift: |val| {
+		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
+			let bytes_res = bytes_vec.try_into();
+			if let Ok(bytes) = bytes_res {
+				return Ok(RecurrenceId(bytes));
+			}
+		}
+		Err(Error::InvalidOfferId.into())
+	},
+	lower: |obj| {
+		hex_utils::to_string(&obj.0)
+	},
+});
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RecurrencePaymentIds {
+	/// Identifier for the long-lived recurring payment relationship.
+	pub recurrence_id: RecurrenceId,
+	/// Identifier for the initial payment attempt only.
+	pub payment_id: PaymentId,
+}
+
+/// Binding-facing snapshot of a durable recurring payment.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RecurrenceDetails {
+	/// Stable identifier for the recurring payment relationship.
+	pub id: RecurrenceId,
+	/// Amount requested for each payment.
+	pub amount_msat: Option<u64>,
+	/// Maximum amount accepted for each payment attempt.
+	pub maximum_amount_msat: Option<u64>,
+	/// Quantity included in each invoice request.
+	pub quantity: Option<u64>,
+	/// Note sent to the payee.
+	pub payer_note: Option<String>,
+	/// Whether future periods are submitted automatically.
+	pub pay_next_automatically: bool,
+	/// Optional period from which the recurrence starts.
+	pub initial_start: Option<u32>,
+	/// Number of successfully completed periods.
+	pub paid_count: u64,
+	/// Recurrence baseline timestamp, once known.
+	pub basetime: Option<u64>,
+	/// Opaque state for the next invoice request.
+	pub opaque_state: Option<Vec<u8>>,
+	/// Most recently successful payment identifier.
+	pub last_successful_payment_id: Option<PaymentId>,
+	/// Currently reserved or submitted payment identifier.
+	pub attempt_payment_id: Option<PaymentId>,
+	/// Current lifecycle status.
+	pub status: crate::payment::recurrence::RecurrenceStatus,
+	/// Number of retries used in the current payment window.
+	pub retry_attempts: u32,
+	/// Earliest timestamp for the next retry, if backoff is active.
+	pub next_retry_at: Option<u64>,
+}
+
+impl From<crate::payment::recurrence::RecurrenceDetails> for RecurrenceDetails {
+	fn from(details: crate::payment::recurrence::RecurrenceDetails) -> Self {
+		let attempt_payment_id = details.attempt.map(|attempt| match attempt {
+			crate::payment::recurrence::RecurrenceAttempt::Prepared { payment_id, .. }
+			| crate::payment::recurrence::RecurrenceAttempt::Submitted { payment_id, .. } => payment_id,
+		});
+		Self {
+			id: details.id,
+			amount_msat: details.amount_msat,
+			maximum_amount_msat: details.maximum_amount_msat,
+			quantity: details.quantity,
+			payer_note: details.payer_note.map(|note| note.to_string()),
+			pay_next_automatically: details.pay_next_automatically,
+			initial_start: details.initial_start,
+			paid_count: details.paid_count,
+			basetime: details.basetime,
+			opaque_state: details.opaque_state,
+			last_successful_payment_id: details.last_successful_payment_id,
+			attempt_payment_id,
+			status: details.status,
+			retry_attempts: details.retry_state.attempts,
+			next_retry_at: details.retry_state.next_retry_at,
+		}
+	}
+}
 
 uniffi::custom_type!(PaymentHash, String, {
 	remote,
