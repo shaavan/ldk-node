@@ -1363,6 +1363,15 @@ mod tests {
 	}
 
 	#[test]
+	fn recurrence_id_has_stable_hex_representation_for_ffi() {
+		let id = RecurrenceId([0xab; 32]);
+		let encoded = id.encode_to_hex_str();
+		assert_eq!(encoded.len(), 64);
+		assert_eq!(RecurrenceId::decode_from_hex_str(&encoded), Some(id));
+		assert!(RecurrenceId::decode_from_hex_str("not-a-recurrence-id").is_none());
+	}
+
+	#[test]
 	fn recurrence_manager_removes_record_and_index_entries() {
 		let expected = state(None);
 		let (manager, _) = manager(Vec::new());
