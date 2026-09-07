@@ -159,6 +159,7 @@ pub use crate::config::default_config;
 use crate::error::Error;
 pub use crate::liquidity::LSPS1OrderStatus;
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
+use crate::payment::recurrence::RecurrenceId;
 pub use crate::probing::ProbingConfig;
 use crate::{hex_utils, SocketAddress, UserChannelId};
 
@@ -1059,6 +1060,28 @@ uniffi::custom_type!(PaymentId, String, {
 		hex_utils::to_string(&obj.0)
 	},
 });
+
+uniffi::custom_type!(RecurrenceId, String, {
+	remote,
+	try_lift: |val| {
+		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
+			let bytes_res = bytes_vec.try_into();
+			if let Ok(bytes) = bytes_res {
+				return Ok(RecurrenceId(bytes));
+			}
+		}
+		Err(Error::InvalidOfferId.into())
+	},
+	lower: |obj| {
+		hex_utils::to_string(&obj.0)
+	},
+});
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RecurrencePaymentIds {
+	pub recurrence_id: RecurrenceId,
+	pub payment_id: PaymentId,
+}
 
 uniffi::custom_type!(PaymentHash, String, {
 	remote,
