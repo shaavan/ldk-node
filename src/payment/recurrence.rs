@@ -60,6 +60,7 @@ impl StorableObjectId for RecurrenceId {
 
 /// The lifecycle status of a recurring offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RecurrenceStatus {
 	Active,
 	CancellationPending,
@@ -104,6 +105,7 @@ impl_ser_tlv_based!(RecurrenceRetryState, {
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrenceRetryPolicy {
 	pub max_retries: u32,
 }
@@ -200,6 +202,7 @@ pub struct RecurrenceState {
 pub type RecurrenceDetails = RecurrenceState;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrenceConfig {
 	pub amount_msat: Option<u64>,
 	pub maximum_amount_msat: Option<u64>,
@@ -227,6 +230,7 @@ impl Default for RecurrenceConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecurrencePaymentWindow {
 	pub period_index: u32,
 	pub opens_at: u64,

@@ -31,6 +31,8 @@ use lightning_types::string::UntrustedString;
 
 use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
+#[cfg(feature = "uniffi")]
+use crate::ffi::RecurrencePaymentIds;
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::recurrence::RecurrenceManager;
@@ -181,7 +183,7 @@ impl Bolt12Payment {
 	pub fn start_recurrence(
 		&self, offer: &Offer, config: RecurrenceConfig,
 	) -> Result<(RecurrenceId, PaymentId), Error> {
-		let result = self.initiate_recurrence(
+		let result = self.initiate_recurrence_inner(
 			offer,
 			config.amount_msat,
 			config.maximum_amount_msat,
@@ -264,9 +266,12 @@ impl Bolt12Payment {
 	}
 
 	/// Removes a completed recurrence without removing its ordinary payment history.
-	#[cfg(not(feature = "uniffi"))]
-	pub fn remove_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
-		let details = self.recurrence(recurrence_id)?;
+	fn remove_recurrence_inner(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		let details = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::InvalidOfferId)?;
 		if !matches!(
 			details.status,
 			RecurrenceStatus::Cancelled
@@ -305,8 +310,7 @@ impl Bolt12Payment {
 	/// The returned [`RecurrenceId`] identifies the complete recurring relationship and must be
 	/// retained for its lifetime. The returned [`PaymentId`] identifies only the initial payment
 	/// attempt. Both identifiers are generated after validation and persisted before submission.
-	#[cfg(not(feature = "uniffi"))]
-	pub fn initiate_recurrence(
+	fn initiate_recurrence_inner(
 		&self, offer: &Offer, amount_msat: Option<u64>, maximum_amount_msat: Option<u64>,
 		quantity: Option<u64>, payer_note: Option<String>,
 		route_parameters: Option<RouteParametersConfig>, initial_start: Option<u32>,
@@ -425,8 +429,7 @@ impl Bolt12Payment {
 	///
 	/// Once the attempt is durably recorded, the returned [`PaymentId`] remains valid even when
 	/// synchronous submission fails; inspect the recurrence and payment records for that result.
-	#[cfg(not(feature = "uniffi"))]
-	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
+	fn pay_next_recurrence_inner(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
 		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
@@ -566,8 +569,7 @@ impl Bolt12Payment {
 
 	/// Cancels a recurring offer locally and, after the first successful payment, queues a
 	/// continuity-preserving cancellation request for the payee.
-	#[cfg(not(feature = "uniffi"))]
-	pub fn cancel_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+	fn cancel_recurrence_inner(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
 		let Some(mut details) = self
 			.runtime
 			.block_on(self.recurrence_manager.get(&recurrence_id))
@@ -786,8 +788,80 @@ impl Bolt12Payment {
 	}
 }
 
+#[cfg(not(feature = "uniffi"))]
+impl Bolt12Payment {
+	/// Registers and submits the primary invoice request for a recurring offer.
+	pub fn initiate_recurrence(
+		&self, offer: &Offer, amount_msat: Option<u64>, maximum_amount_msat: Option<u64>,
+		quantity: Option<u64>, payer_note: Option<String>,
+		route_parameters: Option<RouteParametersConfig>, initial_start: Option<u32>,
+	) -> Result<(RecurrenceId, PaymentId), Error> {
+		self.initiate_recurrence_inner(
+			offer,
+			amount_msat,
+			maximum_amount_msat,
+			quantity,
+			payer_note,
+			route_parameters,
+			initial_start,
+		)
+	}
+
+	/// Submits the next sequential payment for a recurrence.
+	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
+		self.pay_next_recurrence_inner(recurrence_id)
+	}
+
+	/// Cancels a recurrence.
+	pub fn cancel_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		self.cancel_recurrence_inner(recurrence_id)
+	}
+
+	/// Removes a terminal recurrence without removing ordinary payment history.
+	pub fn remove_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		self.remove_recurrence_inner(recurrence_id)
+	}
+}
+
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Bolt12Payment {
+	/// Starts the primary invoice request for a recurring offer.
+	#[cfg(feature = "uniffi")]
+	pub fn initiate_recurrence(
+		&self, offer: &Offer, config: RecurrenceConfig,
+	) -> Result<RecurrencePaymentIds, Error> {
+		let (recurrence_id, payment_id) = self
+			.initiate_recurrence_inner(
+				offer,
+				config.amount_msat,
+				config.maximum_amount_msat,
+				config.quantity,
+				config.payer_note,
+				config.routing_override,
+				config.initial_start,
+			)
+			.map_err(|e| e)?;
+		Ok(RecurrencePaymentIds { recurrence_id, payment_id })
+	}
+
+	/// Submits the next sequential payment for a recurrence.
+	#[cfg(feature = "uniffi")]
+	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
+		self.pay_next_recurrence_inner(recurrence_id)
+	}
+
+	/// Cancels a recurrence and sends a continuity-preserving cancellation when possible.
+	#[cfg(feature = "uniffi")]
+	pub fn cancel_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		self.cancel_recurrence_inner(recurrence_id)
+	}
+
+	/// Removes a terminal recurrence without removing its ordinary payment history.
+	#[cfg(feature = "uniffi")]
+	pub fn remove_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		self.remove_recurrence_inner(recurrence_id)
+	}
+
 	/// Send a payment given an offer.
 	///
 	/// If `payer_note` is `Some` it will be seen by the recipient and reflected back in the invoice
