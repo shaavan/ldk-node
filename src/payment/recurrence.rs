@@ -945,6 +945,26 @@ mod tests {
 		assert!(manager.is_recovery_complete());
 	}
 
+	#[tokio::test]
+	async fn recovery_treats_fulfilled_attempt_as_authoritative_success() {
+		let mut details = state(None);
+		details.attempt =
+			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([80; 32]), amount_msat: 81 });
+		let (manager, _) = manager(vec![details.clone()]);
+		let retry = manager
+			.reconcile_attempts(&[RecentPaymentDetails::Fulfilled {
+				payment_id: PaymentId([80; 32]),
+				payment_hash: None,
+				fee_paid_msat: None,
+			}])
+			.await
+			.unwrap();
+		assert!(retry.is_empty());
+		let recovered = manager.get(&details.id).await.unwrap().unwrap();
+		assert_eq!(recovered.last_successful_payment_id, Some(PaymentId([80; 32])));
+		assert!(recovered.attempt.is_none());
+	}
+
 	#[test]
 	fn successful_payment_advances_and_replay_is_idempotent() {
 		let mut details = state(Some(vec![1, 2]));
