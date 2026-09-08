@@ -51,7 +51,9 @@ use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
-use crate::payment::recurrence::{RecurrenceManager, RecurrenceRetryState, RecurrenceStatus};
+use crate::payment::recurrence::{
+	RecurrenceAttempt, RecurrenceManager, RecurrenceRetryState, RecurrenceStatus,
+};
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -744,7 +746,20 @@ where
 			return Ok(());
 		};
 
+		if matches!(
+			details.status,
+			RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+		) {
+			return Ok(());
+		}
 		if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
+			return Ok(());
+		}
+		if !matches!(
+			&details.attempt,
+			Some(RecurrenceAttempt::Prepared { payment_id: attempt_id, .. })
+				| Some(RecurrenceAttempt::Submitted { payment_id: attempt_id, .. }) if *attempt_id == payment_id
+		) {
 			return Ok(());
 		}
 
