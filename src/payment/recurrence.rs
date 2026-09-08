@@ -1135,6 +1135,13 @@ mod tests {
 	}
 
 	#[test]
+	fn scheduler_ignores_records_without_a_recoverable_due_time() {
+		let manager = manager(Vec::new()).0;
+		let details = state(None);
+		assert_eq!(manager.next_due_at(&details), None);
+	}
+
+	#[test]
 	fn ldk_calendar_helpers_cover_seconds_days_months_and_month_end() {
 		assert_eq!(RecurrencePeriod::Seconds(60).start_time(100, 2), Ok(220));
 		assert_eq!(RecurrencePeriod::Days(1).start_time(86_400, 2), Ok(259_200));
