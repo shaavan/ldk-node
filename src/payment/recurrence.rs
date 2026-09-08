@@ -820,8 +820,23 @@ mod tests {
 			1
 		);
 		let claimed = manager.get(&expected.id).await.unwrap().unwrap();
-		assert!(matches!(claimed.attempt, Some(RecurrenceAttempt::Prepared { .. })));
+		assert!(matches!(
+			claimed.attempt,
+			Some(RecurrenceAttempt::Prepared { payment_id, .. })
+				if payment_id == PaymentId([30; 32]) || payment_id == PaymentId([32; 32])
+		));
 		assert_eq!(claimed.transition_id, expected.transition_id + 1);
+	}
+
+	#[tokio::test]
+	async fn recurrence_manager_does_not_claim_cancelled_recurrence() {
+		let mut expected = state(None);
+		expected.status = RecurrenceStatus::Cancelled;
+		expected.cancellation = RecurrenceCancellationState::Cancelled;
+		let (manager, _) = manager(vec![expected.clone()]);
+		let attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([34; 32]), amount_msat: 35 };
+		assert!(manager.claim_attempt(&expected.id, attempt).await.unwrap().is_none());
 	}
 
 	#[tokio::test]
