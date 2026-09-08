@@ -225,6 +225,36 @@ impl RecurrenceManager {
 		Ok(result)
 	}
 
+	/// Atomically reserves the single durable attempt slot for a recurrence.
+	///
+	/// The store mutation lock covers the read, eligibility check, transition increment, and
+	/// persistence. This prevents manual payment, retry, recovery, and scheduling paths from
+	/// observing the same empty slot and creating competing attempts.
+	pub(crate) async fn claim_attempt(
+		&self, id: &RecurrenceId, attempt: RecurrenceAttempt,
+	) -> Result<Option<RecurrenceDetails>, crate::Error> {
+		let claimed = self
+			.store
+			.mutate(id, |current| {
+				let current = current?;
+				if current.status != RecurrenceStatus::Active || current.attempt.is_some() {
+					return None;
+				}
+
+				let mut updated = current.clone();
+				updated.transition_id = updated.transition_id.checked_add(1)?;
+				updated.attempt = Some(attempt.clone());
+				updated.validate().ok()?;
+				Some(updated)
+			})
+			.await?;
+
+		if let Some(details) = &claimed {
+			self.index(details);
+		}
+		Ok(claimed)
+	}
+
 	pub(crate) async fn remove(&self, id: &RecurrenceId) -> Result<(), crate::Error> {
 		self.store.remove(id).await?;
 		self.payment_index.lock().expect("lock").retain(|_, recurrence_id| recurrence_id != id);
