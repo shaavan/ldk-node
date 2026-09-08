@@ -703,4 +703,30 @@ mod tests {
 		restarted.rebuild_index().await;
 		assert_eq!(restarted.get(&expected.id).await.unwrap().map(|v| v.id), Some(expected.id));
 	}
+
+	#[tokio::test]
+	async fn recurrence_manager_claims_only_one_concurrent_attempt() {
+		let mut expected = state(None);
+		expected.status = RecurrenceStatus::Active;
+		expected.cancellation = RecurrenceCancellationState::NotRequested;
+		expected.attempt = None;
+		expected.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+		let (manager, _) = manager(vec![expected.clone()]);
+		let first_attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([30; 32]), amount_msat: 31 };
+		let second_attempt =
+			RecurrenceAttempt::Prepared { payment_id: PaymentId([32; 32]), amount_msat: 33 };
+
+		let (first, second) = tokio::join!(
+			manager.claim_attempt(&expected.id, first_attempt),
+			manager.claim_attempt(&expected.id, second_attempt)
+		);
+		assert_eq!(
+			first.as_ref().unwrap().is_some() as u8 + second.as_ref().unwrap().is_some() as u8,
+			1
+		);
+		let claimed = manager.get(&expected.id).await.unwrap().unwrap();
+		assert!(matches!(claimed.attempt, Some(RecurrenceAttempt::Prepared { .. })));
+		assert_eq!(claimed.transition_id, expected.transition_id + 1);
+	}
 }
