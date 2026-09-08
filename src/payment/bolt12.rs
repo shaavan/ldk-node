@@ -366,12 +366,14 @@ impl Bolt12Payment {
 		let amount_msat = details.amount_msat.ok_or(Error::InvalidAmount)?;
 		let payment_id = PaymentId(self.keys_manager.get_secure_random_bytes());
 		let retry_policy = details.retry_policy;
-		details.attempt = Some(RecurrenceAttempt::Prepared { payment_id, amount_msat });
-		details.failure = None;
-		details.transition_id += 1;
-		self.runtime
-			.block_on(self.recurrence_manager.update(details.clone()))
-			.map_err(|_| Error::PersistenceFailed)?;
+		details = self
+			.runtime
+			.block_on(self.recurrence_manager.claim_attempt(
+				&recurrence_id,
+				RecurrenceAttempt::Prepared { payment_id, amount_msat },
+			))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::PaymentSendingFailed)?;
 		let payment = PaymentDetails::new(
 			payment_id,
 			PaymentKind::Bolt12Offer {
