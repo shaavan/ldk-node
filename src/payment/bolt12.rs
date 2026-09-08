@@ -220,7 +220,6 @@ impl Bolt12Payment {
 			Some(_) => return Err(Error::UnsupportedCurrency),
 			None => None,
 		};
-<<<<<<< HEAD
 		let amount_msat =
 			validate_recurrence_amount(offer_amount_msat, amount_msat, maximum_amount_msat)?;
 		if amount_msat == 0 || maximum_amount_msat == Some(0) {
