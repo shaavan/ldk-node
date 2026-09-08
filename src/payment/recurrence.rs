@@ -6,10 +6,12 @@
 // accordance with one or both of these licenses.
 
 use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
 use lightning::offers::offer::OfferId;
 use lightning::routing::router::RouteParametersConfig;
 use lightning::util::ser::{Readable, Writeable, Writer};
+use lightning::{_init_and_read_len_prefixed_tlv_fields, write_tlv_fields};
 use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_types::string::UntrustedString;
 
@@ -158,27 +160,146 @@ impl Default for RecurrenceState {
 	}
 }
 
-impl_ser_tlv_based!(RecurrenceState, {
-	(0, id, required),
-	(2, original_offer, required),
-	(4, amount_msat, option),
-	(6, maximum_amount_msat, option),
-	(8, quantity, option),
-	(10, payer_note, option),
-	(12, routing_override, option),
-	(14, retry_policy, required),
-	(16, retry_state, required),
-	(18, pay_next_automatically, required),
-	(20, initial_start, required),
-	(22, paid_count, required),
-	(24, basetime, required),
-	(26, opaque_state, option),
-	(28, last_successful_payment_id, option),
-	(30, attempt, option),
-	(32, cancellation, required),
-	(34, transition_id, required),
-	(36, status, required),
-});
+impl RecurrenceState {
+	/// Validates persisted recurrence invariants before state enters memory or storage.
+	pub(crate) fn validate(&self) -> Result<(), DecodeError> {
+		if self.original_offer.is_empty()
+			|| self.amount_msat == Some(0)
+			|| self.maximum_amount_msat == Some(0)
+			|| self.quantity == Some(0)
+			|| self
+				.maximum_amount_msat
+				.zip(self.amount_msat)
+				.is_some_and(|(maximum, amount)| amount > maximum)
+			|| self.basetime < self.initial_start
+			|| self.paid_count > self.transition_id
+		{
+			return Err(DecodeError::InvalidValue);
+		}
+
+		if self.retry_state.attempts == 0 && self.retry_state.next_retry_at.is_some() {
+			return Err(DecodeError::InvalidValue);
+		}
+
+		if let Some(attempt) = &self.attempt {
+			let amount_msat = match attempt {
+				RecurrenceAttempt::Prepared { amount_msat, .. }
+				| RecurrenceAttempt::Submitted { amount_msat, .. } => *amount_msat,
+			};
+			if amount_msat == 0
+				|| self.maximum_amount_msat.is_some_and(|maximum| amount_msat > maximum)
+				|| !matches!(
+					self.status,
+					RecurrenceStatus::Active | RecurrenceStatus::RequiresAttention
+				) {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+
+		match (self.status, self.cancellation) {
+			(RecurrenceStatus::Active, RecurrenceCancellationState::NotRequested)
+			| (RecurrenceStatus::CancellationPending, RecurrenceCancellationState::Pending)
+			| (RecurrenceStatus::Cancelled, RecurrenceCancellationState::Cancelled) => {},
+			(
+				RecurrenceStatus::Completed | RecurrenceStatus::Missed,
+				RecurrenceCancellationState::NotRequested,
+			) => {
+				if self.attempt.is_some() || self.retry_state.next_retry_at.is_some() {
+					return Err(DecodeError::InvalidValue);
+				}
+			},
+			(RecurrenceStatus::RequiresAttention, _) => {},
+			_ => return Err(DecodeError::InvalidValue),
+		}
+
+		if matches!(
+			self.status,
+			RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+		) && (self.attempt.is_some() || self.retry_state.next_retry_at.is_some())
+		{
+			return Err(DecodeError::InvalidValue);
+		}
+
+		Ok(())
+	}
+}
+
+impl Writeable for RecurrenceState {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
+		write_tlv_fields!(writer, {
+			(0, self.id, required),
+			(2, self.original_offer, required),
+			(4, self.amount_msat, option),
+			(6, self.maximum_amount_msat, option),
+			(8, self.quantity, option),
+			(10, self.payer_note, option),
+			(12, self.routing_override, option),
+			(14, self.retry_policy, required),
+			(16, self.retry_state, required),
+			(18, self.pay_next_automatically, required),
+			(20, self.initial_start, required),
+			(22, self.paid_count, required),
+			(24, self.basetime, required),
+			(26, self.opaque_state, option),
+			(28, self.last_successful_payment_id, option),
+			(30, self.attempt, option),
+			(32, self.cancellation, required),
+			(34, self.transition_id, required),
+			(36, self.status, required)
+		});
+		Ok(())
+	}
+}
+
+impl Readable for RecurrenceState {
+	fn read<R: lightning::io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		_init_and_read_len_prefixed_tlv_fields!(reader, {
+			(0, id, required),
+			(2, original_offer, required),
+			(4, amount_msat, option),
+			(6, maximum_amount_msat, option),
+			(8, quantity, option),
+			(10, payer_note, option),
+			(12, routing_override, option),
+			(14, retry_policy, required),
+			(16, retry_state, required),
+			(18, pay_next_automatically, required),
+			(20, initial_start, required),
+			(22, paid_count, required),
+			(24, basetime, required),
+			(26, opaque_state, option),
+			(28, last_successful_payment_id, option),
+			(30, attempt, option),
+			(32, cancellation, required),
+			(34, transition_id, required),
+			(36, status, required)
+		});
+
+		let state = Self {
+			id: id.0.ok_or(DecodeError::InvalidValue)?,
+			original_offer: original_offer.0.ok_or(DecodeError::InvalidValue)?,
+			amount_msat: amount_msat.0,
+			maximum_amount_msat: maximum_amount_msat.0,
+			quantity: quantity.0,
+			payer_note: payer_note.0,
+			routing_override: routing_override.0,
+			retry_policy: retry_policy.0.ok_or(DecodeError::InvalidValue)?,
+			retry_state: retry_state.0.ok_or(DecodeError::InvalidValue)?,
+			pay_next_automatically: pay_next_automatically.0.ok_or(DecodeError::InvalidValue)?,
+			initial_start: initial_start.0.ok_or(DecodeError::InvalidValue)?,
+			paid_count: paid_count.0.ok_or(DecodeError::InvalidValue)?,
+			basetime: basetime.0.ok_or(DecodeError::InvalidValue)?,
+			opaque_state: opaque_state.0,
+			last_successful_payment_id: last_successful_payment_id.0,
+			attempt: attempt.0,
+			cancellation: cancellation.0.ok_or(DecodeError::InvalidValue)?,
+			transition_id: transition_id.0.ok_or(DecodeError::InvalidValue)?,
+			status: status.0.ok_or(DecodeError::InvalidValue)?,
+		};
+		state.validate()?;
+		Ok(state)
+	}
+}
 
 impl From<OfferId> for RecurrenceId {
 	fn from(offer_id: OfferId) -> Self {
