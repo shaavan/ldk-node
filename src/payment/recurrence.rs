@@ -215,6 +215,7 @@ impl RecurrenceManager {
 	}
 
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
+		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
 		self.store.insert(details.clone()).await?;
 		self.index(&details);
 		Ok(())
@@ -229,6 +230,7 @@ impl RecurrenceManager {
 	pub(crate) async fn update(
 		&self, details: RecurrenceDetails,
 	) -> Result<crate::data_store::DataStoreUpdateResult, crate::Error> {
+		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
 		let result = self.store.update(details.to_update()).await?;
 		self.index(&details);
 		Ok(result)
@@ -351,7 +353,6 @@ impl RecurrenceState {
 				.maximum_amount_msat
 				.zip(self.amount_msat)
 				.is_some_and(|(maximum, amount)| amount > maximum)
-			|| self.basetime < self.initial_start
 			|| self.paid_count > self.transition_id
 		{
 			return Err(DecodeError::InvalidValue);

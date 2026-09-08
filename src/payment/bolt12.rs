@@ -159,8 +159,14 @@ impl Bolt12Payment {
 			None => None,
 		};
 		let amount_msat = amount_msat.or(offer_amount_msat);
-		if amount_msat.is_none() {
+		if amount_msat.is_none() || amount_msat == Some(0) {
 			return Err(Error::InvalidAmount);
+		}
+		if maximum_amount_msat == Some(0) {
+			return Err(Error::InvalidAmount);
+		}
+		if quantity == Some(0) {
+			return Err(Error::InvalidQuantity);
 		}
 		if let Some(maximum_amount_msat) = maximum_amount_msat {
 			if amount_msat.unwrap() > maximum_amount_msat {
