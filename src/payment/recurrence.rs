@@ -304,16 +304,44 @@ impl RecurrenceManager {
 			.collect();
 		let mut retry = Vec::new();
 		for mut details in self.list().await {
-			let Some(RecurrenceAttempt::Prepared { payment_id, amount_msat }) = details.attempt
-			else {
+			let Some(attempt) = details.attempt.clone() else {
 				continue;
 			};
-			if recent.contains_key(&payment_id) {
-				details.attempt = Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
-				details.transition_id += 1;
-				self.update(details).await?;
-			} else {
-				retry.push(details);
+			let (payment_id, amount_msat, prepared) = match attempt {
+				RecurrenceAttempt::Prepared { payment_id, amount_msat } => {
+					(payment_id, amount_msat, true)
+				},
+				RecurrenceAttempt::Submitted { payment_id, amount_msat } => {
+					(payment_id, amount_msat, false)
+				},
+			};
+			match recent.get(&payment_id) {
+				Some(RecentPaymentDetails::Fulfilled { .. }) => {
+					details.last_successful_payment_id = Some(payment_id);
+					details.paid_count = details.paid_count.saturating_add(1);
+					details.attempt = None;
+					details.failure = None;
+					details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details).await?;
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) if prepared => {
+					details.attempt =
+						Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+					details.transition_id = details.transition_id.saturating_add(1);
+					self.update(details).await?;
+				},
+				Some(
+					RecentPaymentDetails::AwaitingInvoice { .. }
+					| RecentPaymentDetails::Pending { .. },
+				) => {},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None if prepared => {
+					retry.push(details)
+				},
+				Some(RecentPaymentDetails::Abandoned { .. }) | None => {},
 			}
 		}
 		self.recovery_complete.store(true, Ordering::Release);
