@@ -902,6 +902,7 @@ mod tests {
 			Some(200),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
+		assert_eq!(details.retry_state.next_retry_at, None);
 	}
 
 	#[test]
