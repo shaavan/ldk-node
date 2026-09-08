@@ -232,7 +232,11 @@ pub(crate) fn record_failure(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, failure: RecurrenceFailure, now: u64,
 	closing_time: Option<u64>,
 ) {
-	if details.last_successful_payment_id == Some(payment_id) {
+	if details.last_successful_payment_id == Some(payment_id)
+		|| matches!(
+			details.status,
+			RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+		) {
 		return;
 	}
 	details.attempt = None;
@@ -240,6 +244,7 @@ pub(crate) fn record_failure(
 	details.transition_id = details.transition_id.saturating_add(1);
 	if closing_time.map(|closing| now >= closing).unwrap_or(false) {
 		details.status = RecurrenceStatus::Missed;
+		details.retry_state.next_retry_at = None;
 	}
 }
 
