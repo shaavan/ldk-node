@@ -153,6 +153,12 @@ pub(crate) fn record_success(
 	details: &mut RecurrenceDetails, payment_id: PaymentId, basetime: u64,
 	next_state: Option<&[u8]>, period_index: u32, recurrence_limit: Option<u32>,
 ) {
+	if matches!(
+		details.status,
+		RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
+	) {
+		return;
+	}
 	if details.last_successful_payment_id == Some(payment_id) && details.attempt.is_none() {
 		return;
 	}
@@ -827,5 +833,18 @@ mod tests {
 		record_success(&mut details, PaymentId([51; 32]), 100, None, 1, Some(1));
 		assert_eq!(details.paid_count, 2);
 		assert_eq!(details.status, RecurrenceStatus::Completed);
+	}
+
+	#[test]
+	fn terminal_success_replay_does_not_change_recurrence() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Completed;
+		details.paid_count = 2;
+		details.transition_id = 3;
+		let before = details.clone();
+		record_success(&mut details, PaymentId([52; 32]), 100, Some(&[5]), 2, Some(2));
+		assert_eq!(details.paid_count, before.paid_count);
+		assert_eq!(details.transition_id, before.transition_id);
+		assert_eq!(details.basetime, before.basetime);
 	}
 }
