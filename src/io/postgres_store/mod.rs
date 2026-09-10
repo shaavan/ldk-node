@@ -725,10 +725,8 @@ impl PostgresStoreInner {
 				self,
 				locked,
 				err_map,
-				locked.execute(
-					sql.as_str(),
-					&[&primary_namespace, &secondary_namespace, &key, &buf],
-				)
+				locked
+					.execute(sql.as_str(), &[&primary_namespace, &secondary_namespace, &key, &buf],)
 			)
 			.map(|_| ())
 		})
