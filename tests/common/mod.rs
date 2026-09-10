@@ -972,8 +972,7 @@ pub(crate) async fn wait_for_channel_ready_to_send(
 	while tokio::time::Instant::now() < deadline {
 		let ready = source_node.list_channels().iter().any(|c| {
 			c.counterparty.node_id == counterparty
-				&& c.is_usable
-				&& c.next_outbound_htlc_limit_msat >= min_amount_msat
+				&& c.is_usable && c.next_outbound_htlc_limit_msat >= min_amount_msat
 		});
 		if ready {
 			return;

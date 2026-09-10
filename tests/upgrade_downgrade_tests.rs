@@ -276,8 +276,7 @@ async fn wait_for_current_channel_usable(
 	while tokio::time::Instant::now() < deadline {
 		let is_usable = node.list_channels().iter().any(|c| {
 			c.counterparty.node_id == counterparty_node_id
-				&& c.is_usable
-				&& c.next_outbound_htlc_limit_msat >= min_outbound_amount_msat
+				&& c.is_usable && c.next_outbound_htlc_limit_msat >= min_outbound_amount_msat
 		});
 		if is_usable {
 			return;

@@ -936,15 +936,13 @@ mod read_objects_tests {
 
 		fn write(
 			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
-		) -> impl std::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send
-		{
+		) -> impl std::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send {
 			self.inner.write(primary_namespace, secondary_namespace, key, buf)
 		}
 
 		fn remove(
 			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
-		) -> impl std::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send
-		{
+		) -> impl std::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send {
 			self.inner.remove(primary_namespace, secondary_namespace, key, lazy)
 		}
 

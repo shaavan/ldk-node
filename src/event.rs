@@ -812,7 +812,8 @@ where
 							)
 							.unwrap_or_else(|e| {
 								log_error!(self.logger, "Failed to force close channel after funding generation failed: {:?}", e);
-								debug_assert!(false,
+								debug_assert!(
+									false,
 									"Failed to force close channel after funding generation failed"
 								);
 							});

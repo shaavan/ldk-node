@@ -282,16 +282,21 @@ where
 								request_id,
 								counterparty_node_id
 							);
-							lsps2_service_handler.invalid_token_provided(&counterparty_node_id, request_id.clone()).unwrap_or_else(|e| {
-								debug_assert!(false, "Failed to reject LSPS2 request. This should never happen.");
-								log_error!(
+							lsps2_service_handler
+								.invalid_token_provided(&counterparty_node_id, request_id.clone())
+								.unwrap_or_else(|e| {
+									debug_assert!(
+										false,
+										"Failed to reject LSPS2 request. This should never happen."
+									);
+									log_error!(
 									self.logger,
 									"Failed to reject LSPS2 request {:?} from counterparty {} due to: {:?}. This should never happen.",
 									request_id,
 									counterparty_node_id,
 									e
 								);
-							});
+								});
 							return;
 						}
 					}
