@@ -857,6 +857,15 @@ where
 		else {
 			return Ok(());
 		};
+		if !matches!(
+			&details.attempt,
+			Some(
+				RecurrenceAttempt::Prepared { payment_id: id, .. }
+				| RecurrenceAttempt::Submitted { payment_id: id, .. }
+			) if id == &payment_id
+		) {
+			return Ok(());
+		}
 		let previous_status = details.status;
 		let failure = match reason {
 			Some(

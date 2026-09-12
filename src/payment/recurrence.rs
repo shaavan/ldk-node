@@ -13,7 +13,7 @@ use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::outbound_payment::Retry;
 pub(crate) use lightning::offers::invoice_request::RecurrenceId;
-use lightning::offers::offer::{Offer, OfferId};
+use lightning::offers::offer::Offer;
 use lightning::routing::router::RouteParametersConfig;
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::{_init_and_read_len_prefixed_tlv_fields, write_tlv_fields};
@@ -573,8 +573,18 @@ impl RecurrenceManager {
 		let cached_id = self.payment_index.lock().expect("lock").get(payment_id).copied();
 		if let Some(id) = cached_id {
 			if let Some(details) = self.store.get(&id).await? {
-				return Ok(Some(details));
+				if details.last_successful_payment_id.as_ref() == Some(payment_id)
+					|| matches!(
+						&details.attempt,
+						Some(
+							RecurrenceAttempt::Prepared { payment_id: id, .. }
+								| RecurrenceAttempt::Submitted { payment_id: id, .. }
+						) if id == payment_id
+					) {
+					return Ok(Some(details));
+				}
 			}
+			self.payment_index.lock().expect("lock").remove(payment_id);
 		}
 
 		let details = self
@@ -594,15 +604,24 @@ impl RecurrenceManager {
 
 	/// Adds the successful and in-flight payment identifiers for one recurrence to the cache.
 	fn index(&self, details: &RecurrenceDetails) {
+		let last_successful_payment_id = details.last_successful_payment_id;
+		let attempt_payment_id = match details.attempt {
+			Some(
+				RecurrenceAttempt::Prepared { payment_id, .. }
+				| RecurrenceAttempt::Submitted { payment_id, .. },
+			) => Some(payment_id),
+			None => None,
+		};
 		let mut index = self.payment_index.lock().expect("lock");
-		if let Some(payment_id) = details.last_successful_payment_id {
+		index.retain(|payment_id, recurrence_id| {
+			*recurrence_id != details.id
+				|| Some(*payment_id) == last_successful_payment_id
+				|| Some(*payment_id) == attempt_payment_id
+		});
+		if let Some(payment_id) = last_successful_payment_id {
 			index.insert(payment_id, details.id);
 		}
-		if let Some(
-			RecurrenceAttempt::Prepared { payment_id, .. }
-			| RecurrenceAttempt::Submitted { payment_id, .. },
-		) = details.attempt
-		{
+		if let Some(payment_id) = attempt_payment_id {
 			index.insert(payment_id, details.id);
 		}
 	}
@@ -994,10 +1013,18 @@ mod tests {
 		expected.paid_count += 1;
 		manager.update(expected.clone()).await.unwrap();
 		assert_eq!(manager.get(&expected.id).await.unwrap().unwrap().paid_count, 20);
+		expected.attempt = None;
+		expected.last_successful_payment_id = Some(PaymentId([31; 32]));
+		manager.update(expected.clone()).await.unwrap();
+		assert!(manager.by_payment_id(&PaymentId([30; 32])).await.unwrap().is_none());
+		assert_eq!(
+			manager.by_payment_id(&PaymentId([31; 32])).await.unwrap().map(|v| v.id),
+			Some(expected.id)
+		);
 
 		manager.payment_index.lock().expect("lock").clear();
 		assert_eq!(
-			manager.by_payment_id(&PaymentId([30; 32])).await.unwrap().map(|v| v.id),
+			manager.by_payment_id(&PaymentId([31; 32])).await.unwrap().map(|v| v.id),
 			Some(expected.id)
 		);
 
