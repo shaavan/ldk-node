@@ -343,7 +343,12 @@ pub(crate) fn record_failure(
 	details.attempt = None;
 	details.failure = Some(failure);
 	details.retry_state.attempts = details.retry_state.attempts.saturating_add(1);
-	if details.retry_state.attempts <= retry_policy.max_retries {
+	if details.paid_count == 0 && details.basetime.is_none() {
+		// Implicit-basetime recurrences cannot calculate a retry window until a payment
+		// succeeds and supplies the payee's recurrence baseline.
+		details.retry_state.next_retry_at = None;
+		details.status = RecurrenceStatus::RequiresAttention;
+	} else if details.retry_state.attempts <= retry_policy.max_retries {
 		details.retry_state.next_retry_at =
 			now.checked_add(recurrence_retry_delay(details.retry_state.attempts));
 	} else {
@@ -1183,6 +1188,24 @@ mod tests {
 			RecurrenceRetryPolicy::default(),
 		);
 		assert_eq!(details.status, RecurrenceStatus::Missed);
+		assert_eq!(details.retry_state.next_retry_at, None);
+	}
+
+	#[test]
+	fn initial_implicit_basetime_failure_requires_attention() {
+		let mut details = state(None);
+		details.status = RecurrenceStatus::Active;
+		details.paid_count = 0;
+		details.basetime = None;
+		record_failure(
+			&mut details,
+			PaymentId([65; 32]),
+			RecurrenceFailure::RouteFailed,
+			100,
+			None,
+			RecurrenceRetryPolicy::default(),
+		);
+		assert_eq!(details.status, RecurrenceStatus::RequiresAttention);
 		assert_eq!(details.retry_state.next_retry_at, None);
 	}
 

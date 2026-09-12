@@ -523,7 +523,7 @@ impl Bolt12Payment {
 		else {
 			return Err(Error::InvalidOfferId);
 		};
-		if details.status != RecurrenceStatus::Active || details.paid_count == 0 {
+		if details.status != RecurrenceStatus::Active {
 			return Err(Error::InvalidOffer);
 		}
 		if details.attempt.is_some() {
