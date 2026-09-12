@@ -2176,7 +2176,9 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 		async_payments_role,
 	);
-	let retry = match runtime.block_on(recurrence_manager.reconcile_attempts(&recent_payments)) {
+	let retry = match runtime
+		.block_on(recurrence_manager.reconcile_attempts(&recent_payments, Some(&event_queue)))
+	{
 		Ok(retry) => retry,
 		Err(_) => return Err(BuildError::ReadFailed),
 	};

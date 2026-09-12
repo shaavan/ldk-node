@@ -21,7 +21,9 @@ use lightning::{impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_types::string::UntrustedString;
 
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
+use crate::event::{Event, EventQueue};
 use crate::hex_utils;
+use crate::logger::Logger;
 use crate::types::RecurrenceStore;
 
 impl StorableObjectId for RecurrenceId {
@@ -409,6 +411,7 @@ impl RecurrenceManager {
 	/// pending and fulfilled attempts are promoted without creating duplicate payments.
 	pub(crate) async fn reconcile_attempts(
 		&self, recent_payments: &[RecentPaymentDetails],
+		event_queue: Option<&EventQueue<Arc<Logger>>>,
 	) -> Result<Vec<RecurrenceDetails>, crate::Error> {
 		let recent: HashMap<PaymentId, &RecentPaymentDetails> = recent_payments
 			.iter()
@@ -437,6 +440,7 @@ impl RecurrenceManager {
 			};
 			match recent.get(&payment_id) {
 				Some(RecentPaymentDetails::Fulfilled { .. }) => {
+					let previous_status = details.status;
 					details.last_successful_payment_id = Some(payment_id);
 					details.attempt = None;
 					details.failure = None;
@@ -445,7 +449,18 @@ impl RecurrenceManager {
 					// advancing an implicit-basetime schedule or enforcing its limit is unsafe.
 					details.status = RecurrenceStatus::RequiresAttention;
 					details.transition_id = details.transition_id.saturating_add(1);
-					self.update(details).await?;
+					self.update(details.clone()).await?;
+					if previous_status != details.status {
+						if let Some(event_queue) = event_queue {
+							event_queue
+								.add_event(Event::RecurrenceStatusChanged {
+									recurrence_id: details.id.0.to_vec(),
+									status: details.status.discriminant(),
+									transition_id: details.transition_id,
+								})
+								.await?;
+						}
+					}
 				},
 				Some(
 					RecentPaymentDetails::AwaitingInvoice { .. }
@@ -1105,9 +1120,10 @@ mod tests {
 			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([73; 32]), amount_msat: 74 });
 		let (manager, _) = manager(vec![known.clone(), absent.clone()]);
 		let retry = manager
-			.reconcile_attempts(&[RecentPaymentDetails::AwaitingInvoice {
-				payment_id: PaymentId([70; 32]),
-			}])
+			.reconcile_attempts(
+				&[RecentPaymentDetails::AwaitingInvoice { payment_id: PaymentId([70; 32]) }],
+				None,
+			)
 			.await
 			.unwrap();
 		assert_eq!(retry.len(), 1);
@@ -1125,12 +1141,18 @@ mod tests {
 		details.attempt =
 			Some(RecurrenceAttempt::Prepared { payment_id: PaymentId([80; 32]), amount_msat: 81 });
 		let (manager, _) = manager(vec![details.clone()]);
+		let event_store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let event_queue = EventQueue::new(event_store, logger);
 		let retry = manager
-			.reconcile_attempts(&[RecentPaymentDetails::Fulfilled {
-				payment_id: PaymentId([80; 32]),
-				payment_hash: None,
-				fee_paid_msat: None,
-			}])
+			.reconcile_attempts(
+				&[RecentPaymentDetails::Fulfilled {
+					payment_id: PaymentId([80; 32]),
+					payment_hash: None,
+					fee_paid_msat: None,
+				}],
+				Some(&event_queue),
+			)
 			.await
 			.unwrap();
 		assert!(retry.is_empty());
@@ -1139,6 +1161,13 @@ mod tests {
 		assert_eq!(recovered.status, RecurrenceStatus::RequiresAttention);
 		assert_eq!(recovered.paid_count, details.paid_count);
 		assert!(recovered.attempt.is_none());
+		assert!(matches!(
+			event_queue.next_event(),
+			Some(Event::RecurrenceStatusChanged { recurrence_id, status, transition_id })
+				if recurrence_id == details.id.0.to_vec()
+					&& status == RecurrenceStatus::RequiresAttention.discriminant()
+					&& transition_id == recovered.transition_id
+		));
 	}
 
 	#[test]
