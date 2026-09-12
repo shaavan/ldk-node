@@ -669,10 +669,7 @@ impl Bolt12Payment {
 		};
 		if matches!(
 			details.status,
-			RecurrenceStatus::Cancelled
-				| RecurrenceStatus::Completed
-				| RecurrenceStatus::Missed
-				| RecurrenceStatus::RequiresAttention
+			RecurrenceStatus::Cancelled | RecurrenceStatus::Completed | RecurrenceStatus::Missed
 		) {
 			return Err(Error::InvalidOffer);
 		}
