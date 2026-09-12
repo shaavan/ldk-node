@@ -838,7 +838,6 @@ impl Node {
 			}
 		});
 
-		#[cfg(not(feature = "uniffi"))]
 		{
 			// Do not schedule until startup reconciliation has classified every durable attempt.
 			let scheduler_payment = self.bolt12_payment();
