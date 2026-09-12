@@ -868,7 +868,10 @@ impl Node {
 								&& details.attempt.is_none()
 						})
 						.filter_map(|details| {
-							let due_at = scheduler_manager.next_due_at(&details)?;
+							let due_at = scheduler_manager.next_recurrence_wake_at(
+								scheduler_manager.next_due_at(&details)?,
+								details.retry_state.next_retry_at,
+							);
 							Some((due_at, details.id))
 						})
 						.min_by_key(|(due_at, _)| *due_at);

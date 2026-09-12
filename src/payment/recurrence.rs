@@ -479,6 +479,11 @@ impl RecurrenceManager {
 		recurrence.payment_window(basetime, period_index).ok().map(|window| window.0)
 	}
 
+	/// Delays scheduler wake-up until both the payment window and retry backoff allow a payment.
+	pub(crate) fn next_recurrence_wake_at(window_open: u64, retry_at: Option<u64>) -> u64 {
+		window_open.max(retry_at.unwrap_or_default())
+	}
+
 	/// Persists a new recurrence and indexes its known payment identifiers.
 	pub(crate) async fn insert(&self, details: RecurrenceDetails) -> Result<(), crate::Error> {
 		details.validate().map_err(|_| crate::Error::PersistenceFailed)?;
@@ -1273,6 +1278,13 @@ mod tests {
 		let manager = manager(Vec::new()).0;
 		let details = state(None);
 		assert_eq!(manager.next_due_at(&details), None);
+	}
+
+	#[test]
+	fn scheduler_wake_waits_for_retry_backoff() {
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, None), 100);
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, Some(90)), 100);
+		assert_eq!(RecurrenceManager::next_recurrence_wake_at(100, Some(120)), 120);
 	}
 
 	#[test]
