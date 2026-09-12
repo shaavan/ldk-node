@@ -868,7 +868,7 @@ impl Node {
 								&& details.attempt.is_none()
 						})
 						.filter_map(|details| {
-							let due_at = scheduler_manager.next_recurrence_wake_at(
+							let due_at = crate::payment::recurrence::RecurrenceManager::next_recurrence_wake_at(
 								scheduler_manager.next_due_at(&details)?,
 								details.retry_state.next_retry_at,
 							);
