@@ -432,10 +432,12 @@ impl RecurrenceManager {
 			match recent.get(&payment_id) {
 				Some(RecentPaymentDetails::Fulfilled { .. }) => {
 					details.last_successful_payment_id = Some(payment_id);
-					details.paid_count = details.paid_count.saturating_add(1);
 					details.attempt = None;
 					details.failure = None;
 					details.retry_state = RecurrenceRetryState { attempts: 0, next_retry_at: None };
+					// Recent-payment records do not retain invoice recurrence metadata. Without it,
+					// advancing an implicit-basetime schedule or enforcing its limit is unsafe.
+					details.status = RecurrenceStatus::RequiresAttention;
 					details.transition_id = details.transition_id.saturating_add(1);
 					self.update(details).await?;
 				},
@@ -1096,6 +1098,8 @@ mod tests {
 		assert!(retry.is_empty());
 		let recovered = manager.get(&details.id).await.unwrap().unwrap();
 		assert_eq!(recovered.last_successful_payment_id, Some(PaymentId([80; 32])));
+		assert_eq!(recovered.status, RecurrenceStatus::RequiresAttention);
+		assert_eq!(recovered.paid_count, details.paid_count);
 		assert!(recovered.attempt.is_none());
 	}
 

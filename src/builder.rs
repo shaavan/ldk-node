@@ -2151,9 +2151,27 @@ fn build_with_store_internal(
 	};
 
 	let channel_manager = Arc::new(channel_manager);
+	let is_running = Arc::new(RwLock::new(false));
 	let recent_payments = channel_manager.list_recent_payments();
-	if runtime.block_on(recurrence_manager.reconcile_attempts(&recent_payments)).is_err() {
-		return Err(BuildError::ReadFailed);
+	let recurrence_payment = crate::Bolt12Payment::new(
+		Arc::clone(&runtime),
+		Arc::clone(&channel_manager),
+		Arc::clone(&keys_manager),
+		Arc::clone(&payment_store),
+		Arc::clone(&recurrence_manager),
+		Arc::clone(&config),
+		Arc::clone(&is_running),
+		Arc::clone(&logger),
+		async_payments_role,
+	);
+	let retry = match runtime.block_on(recurrence_manager.reconcile_attempts(&recent_payments)) {
+		Ok(retry) => retry,
+		Err(_) => return Err(BuildError::ReadFailed),
+	};
+	for details in retry {
+		if recurrence_payment.resubmit_prepared_recurrence(details).is_err() {
+			return Err(BuildError::ReadFailed);
+		}
 	}
 
 	// Give ChannelMonitors to ChainMonitor
@@ -2430,8 +2448,6 @@ fn build_with_store_internal(
 
 	let (stop_sender, _) = tokio::sync::watch::channel(());
 	let (background_processor_stop_sender, _) = tokio::sync::watch::channel(());
-	let is_running = Arc::new(RwLock::new(false));
-
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
 	let prober = probing_config.map(|probing_cfg| {

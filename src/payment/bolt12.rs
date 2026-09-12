@@ -426,6 +426,56 @@ impl Bolt12Payment {
 		Ok((recurrence_id, payment_id))
 	}
 
+	/// Resubmits a durable prepared attempt recovered before startup.
+	pub(crate) fn resubmit_prepared_recurrence(
+		&self, mut details: RecurrenceDetails,
+	) -> Result<(), Error> {
+		let RecurrenceAttempt::Prepared { payment_id, amount_msat } =
+			details.attempt.clone().ok_or(Error::PaymentSendingFailed)?
+		else {
+			return Err(Error::PaymentSendingFailed);
+		};
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+		let counter = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+		let params = lightning::ln::channelmanager::RecurrencePaymentParams {
+			counter,
+			start: details.initial_start,
+			prev_state: details.opaque_state.clone(),
+			quantity: details.quantity,
+			expected_invoice_recurrence_basetime: details.basetime,
+		};
+		let optional_params = OptionalOfferPaymentParams {
+			payer_note: details.payer_note.as_ref().map(ToString::to_string),
+			route_params_config: details
+				.routing_override
+				.or(self.config.route_parameters)
+				.unwrap_or_default(),
+			retry_strategy: details.retry_policy,
+		};
+		if self
+			.channel_manager
+			.pay_for_recurrence(
+				&offer,
+				details.amount_msat.or(Some(amount_msat)),
+				payment_id,
+				details.id,
+				params,
+				optional_params,
+			)
+			.is_ok()
+		{
+			details.attempt = Some(RecurrenceAttempt::Submitted { payment_id, amount_msat });
+		} else {
+			details.status = RecurrenceStatus::RequiresAttention;
+		}
+		details.transition_id = details.transition_id.saturating_add(1);
+		self.runtime
+			.block_on(self.recurrence_manager.update(details))
+			.map(|_| ())
+			.map_err(|_| Error::PersistenceFailed)
+	}
+
 	/// Submits the next sequential payment for an active recurring offer.
 	///
 	/// Once the attempt is durably recorded, the returned [`PaymentId`] remains valid even when
