@@ -511,6 +511,9 @@ impl Bolt12Payment {
 		let (opening, closing) =
 			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		if details.retry_state.next_retry_at.is_some_and(|retry_at| now < retry_at) {
+			return Err(Error::PaymentSendingFailed);
+		}
 		if now < opening {
 			return Err(Error::InvalidOffer);
 		}

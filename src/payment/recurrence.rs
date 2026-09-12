@@ -348,6 +348,7 @@ pub(crate) fn record_failure(
 			now.checked_add(recurrence_retry_delay(details.retry_state.attempts));
 	} else {
 		details.retry_state.next_retry_at = None;
+		details.status = RecurrenceStatus::RequiresAttention;
 	}
 	details.transition_id = details.transition_id.saturating_add(1);
 	if closing_time.map(|closing| now >= closing).unwrap_or(false) {
@@ -1319,6 +1320,7 @@ mod tests {
 			retry_policy,
 		);
 		assert_eq!(details.retry_state.next_retry_at, None);
+		assert_eq!(details.status, RecurrenceStatus::RequiresAttention);
 	}
 
 	#[test]
