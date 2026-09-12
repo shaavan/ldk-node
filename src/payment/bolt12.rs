@@ -942,6 +942,72 @@ impl Bolt12Payment {
 		Ok(RecurrencePaymentIds { recurrence_id, payment_id })
 	}
 
+	/// Returns durable details for a recurring payment.
+	#[cfg(feature = "uniffi")]
+	pub fn recurrence(
+		&self, recurrence_id: RecurrenceId,
+	) -> Result<crate::ffi::RecurrenceDetails, Error> {
+		self.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.map(Into::into)
+			.ok_or(Error::InvalidOfferId)
+	}
+
+	/// Lists all durable recurring payments.
+	#[cfg(feature = "uniffi")]
+	pub fn list_recurrences(&self) -> Vec<crate::ffi::RecurrenceDetails> {
+		self.runtime.block_on(self.recurrence_manager.list()).into_iter().map(Into::into).collect()
+	}
+
+	/// Returns the payment window for a period of an explicit-basetime offer.
+	#[cfg(feature = "uniffi")]
+	pub fn recurrence_payment_window(
+		&self, offer: &Offer, period_index: u32,
+	) -> Result<RecurrencePaymentWindow, Error> {
+		let offer = maybe_deref(offer);
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+		let basetime = match recurrence.recurrence_type {
+			RecurrenceType::Compulsory(Some(base)) => base.basetime,
+			_ => return Err(Error::InvalidOffer),
+		};
+		let (opens_at, closes_at) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		Ok(RecurrencePaymentWindow {
+			period_index,
+			opens_at,
+			closes_at,
+			currently_payable: now >= opens_at && now < closes_at,
+		})
+	}
+
+	/// Returns the next payment window for an existing recurring payment.
+	#[cfg(feature = "uniffi")]
+	pub fn next_recurrence_payment_window(
+		&self, recurrence_id: RecurrenceId,
+	) -> Result<RecurrencePaymentWindow, Error> {
+		let details = self
+			.runtime
+			.block_on(self.recurrence_manager.get(&recurrence_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.ok_or(Error::InvalidOfferId)?;
+		let basetime = details.basetime.ok_or(Error::InvalidOffer)?;
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+		let period_index = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+		let (opens_at, closes_at) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+		Ok(RecurrencePaymentWindow {
+			period_index,
+			opens_at,
+			closes_at,
+			currently_payable: now >= opens_at && now < closes_at,
+		})
+	}
+
 	/// Submits the next sequential payment for a recurrence.
 	#[cfg(feature = "uniffi")]
 	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
