@@ -706,12 +706,14 @@ impl Bolt12Payment {
 				start: details.initial_start,
 				prev_state: details.opaque_state.clone(),
 			};
-			let _ = self.channel_manager.cancel_recurrence(&offer, recurrence_id, params);
+			self.channel_manager
+				.cancel_recurrence(&offer, recurrence_id, params)
+				.map_err(|_| Error::PaymentSendingFailed)?;
 		}
 		details.status = RecurrenceStatus::Cancelled;
 		details.cancellation = RecurrenceCancellationState::Cancelled;
 		details.transition_id += 1;
-		// Mark the record terminal only after the local cancellation work is complete.
+		// Mark the record terminal only after LDK accepts the payee cancellation request.
 		self.runtime
 			.block_on(self.recurrence_manager.update(details))
 			.map_err(|_| Error::PersistenceFailed)?;
