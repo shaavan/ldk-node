@@ -437,6 +437,38 @@ impl Bolt12Payment {
 		};
 		let offer =
 			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+		let payment_amount_msat = details.amount_msat.or(Some(amount_msat));
+		if self
+			.runtime
+			.block_on(self.payment_store.get(&payment_id))
+			.map_err(|_| Error::PersistenceFailed)?
+			.is_none()
+		{
+			let payment = PaymentDetails::new(
+				payment_id,
+				PaymentKind::Bolt12Offer {
+					hash: None,
+					preimage: None,
+					secret: None,
+					offer_id: offer.id(),
+					payer_note: details.payer_note.clone(),
+					quantity: details.quantity,
+				},
+				payment_amount_msat,
+				None,
+				PaymentDirection::Outbound,
+				PaymentStatus::Pending,
+			);
+			if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
+				details.status = RecurrenceStatus::RequiresAttention;
+				details.transition_id = details.transition_id.saturating_add(1);
+				self.runtime
+					.block_on(self.recurrence_manager.update(details))
+					.map(|_| ())
+					.map_err(|_| Error::PersistenceFailed)?;
+				return Ok(());
+			}
+		}
 		let counter = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
 		let params = lightning::ln::channelmanager::RecurrencePaymentParams {
 			counter,
@@ -457,7 +489,7 @@ impl Bolt12Payment {
 			.channel_manager
 			.pay_for_recurrence(
 				&offer,
-				details.amount_msat.or(Some(amount_msat)),
+				payment_amount_msat,
 				payment_id,
 				details.id,
 				params,
