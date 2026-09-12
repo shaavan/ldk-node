@@ -676,18 +676,16 @@ impl Bolt12Payment {
 		) {
 			return Err(Error::InvalidOffer);
 		}
-		if details.status == RecurrenceStatus::CancellationPending {
-			return Ok(());
+		if details.status != RecurrenceStatus::CancellationPending {
+			details.status = RecurrenceStatus::CancellationPending;
+			details.cancellation = RecurrenceCancellationState::Pending;
+			details.transition_id += 1;
+			// Persist the pending state before abandoning or notifying the payee so a restart cannot
+			// resume payment while cancellation is being processed.
+			self.runtime
+				.block_on(self.recurrence_manager.update(details.clone()))
+				.map_err(|_| Error::PersistenceFailed)?;
 		}
-
-		details.status = RecurrenceStatus::CancellationPending;
-		details.cancellation = RecurrenceCancellationState::Pending;
-		details.transition_id += 1;
-		// Persist the pending state before abandoning or notifying the payee so a restart cannot
-		// resume payment while cancellation is being processed.
-		self.runtime
-			.block_on(self.recurrence_manager.update(details.clone()))
-			.map_err(|_| Error::PersistenceFailed)?;
 
 		if let Some(
 			RecurrenceAttempt::Prepared { payment_id, .. }
