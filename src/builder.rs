@@ -2152,6 +2152,17 @@ fn build_with_store_internal(
 
 	let channel_manager = Arc::new(channel_manager);
 	let is_running = Arc::new(RwLock::new(false));
+	let event_queue = match event_queue_res {
+		Ok(event_queue) => Arc::new(event_queue),
+		Err(e) => {
+			if e.kind() == std::io::ErrorKind::NotFound {
+				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
+			} else {
+				log_error!(logger, "Failed to read event queue from store: {}", e);
+				return Err(BuildError::ReadFailed);
+			}
+		},
+	};
 	let recent_payments = channel_manager.list_recent_payments();
 	let recurrence_payment = crate::Bolt12Payment::new(
 		Arc::clone(&runtime),
@@ -2159,6 +2170,7 @@ fn build_with_store_internal(
 		Arc::clone(&keys_manager),
 		Arc::clone(&payment_store),
 		Arc::clone(&recurrence_manager),
+		Arc::clone(&event_queue),
 		Arc::clone(&config),
 		Arc::clone(&is_running),
 		Arc::clone(&logger),
@@ -2409,18 +2421,6 @@ fn build_with_store_internal(
 				))
 			} else {
 				log_error!(logger, "Failed to read output sweeper data from store: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
-	};
-
-	let event_queue = match event_queue_res {
-		Ok(event_queue) => Arc::new(event_queue),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
-			} else {
-				log_error!(logger, "Failed to read event queue from store: {}", e);
 				return Err(BuildError::ReadFailed);
 			}
 		},

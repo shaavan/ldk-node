@@ -31,6 +31,7 @@ use lightning_types::string::UntrustedString;
 
 use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
+use crate::event::{Event, EventQueue};
 #[cfg(feature = "uniffi")]
 use crate::ffi::RecurrencePaymentIds;
 use crate::ffi::{maybe_deref, maybe_wrap};
@@ -170,6 +171,7 @@ pub struct Bolt12Payment {
 	keys_manager: Arc<KeysManager>,
 	payment_store: Arc<PaymentStore>,
 	recurrence_manager: Arc<RecurrenceManager>,
+	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
 	logger: Arc<Logger>,
@@ -280,8 +282,8 @@ impl Bolt12Payment {
 	pub(crate) fn new(
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
 		keys_manager: Arc<KeysManager>, payment_store: Arc<PaymentStore>,
-		recurrence_manager: Arc<RecurrenceManager>, config: Arc<Config>,
-		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		recurrence_manager: Arc<RecurrenceManager>, event_queue: Arc<EventQueue<Arc<Logger>>>,
+		config: Arc<Config>, is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
 		async_payments_role: Option<AsyncPaymentsRole>,
 	) -> Self {
 		Self {
@@ -290,11 +292,31 @@ impl Bolt12Payment {
 			keys_manager,
 			payment_store,
 			recurrence_manager,
+			event_queue,
 			config,
 			is_running,
 			logger,
 			async_payments_role,
 		}
+	}
+
+	fn update_recurrence(
+		&self, previous_status: RecurrenceStatus, details: RecurrenceDetails,
+	) -> Result<(), Error> {
+		let status_changed = previous_status != details.status;
+		self.runtime
+			.block_on(self.recurrence_manager.update(details.clone()))
+			.map_err(|_| Error::PersistenceFailed)?;
+		if status_changed {
+			self.runtime
+				.block_on(self.event_queue.add_event(Event::RecurrenceStatusChanged {
+					recurrence_id: details.id.0.to_vec(),
+					status: details.status.discriminant(),
+					transition_id: details.transition_id,
+				}))
+				.map_err(|_| Error::PersistenceFailed)?;
+		}
+		Ok(())
 	}
 
 	/// Registers and submits the primary invoice request for a recurring offer.
@@ -384,9 +406,10 @@ impl Bolt12Payment {
 		);
 		if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
 			// The recurrence remains durable, but cannot proceed until its payment record is repaired.
+			let previous_status = details.status;
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
-			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			self.update_recurrence(previous_status, details)?;
 			return Ok((recurrence_id, payment_id));
 		}
 
@@ -422,7 +445,7 @@ impl Bolt12Payment {
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
 		}
-		let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+		self.update_recurrence(RecurrenceStatus::Active, details)?;
 		Ok((recurrence_id, payment_id))
 	}
 
@@ -430,6 +453,7 @@ impl Bolt12Payment {
 	pub(crate) fn resubmit_prepared_recurrence(
 		&self, mut details: RecurrenceDetails,
 	) -> Result<(), Error> {
+		let previous_status = details.status;
 		let RecurrenceAttempt::Prepared { payment_id, amount_msat } =
 			details.attempt.clone().ok_or(Error::PaymentSendingFailed)?
 		else {
@@ -462,10 +486,7 @@ impl Bolt12Payment {
 			if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
 				details.status = RecurrenceStatus::RequiresAttention;
 				details.transition_id = details.transition_id.saturating_add(1);
-				self.runtime
-					.block_on(self.recurrence_manager.update(details))
-					.map(|_| ())
-					.map_err(|_| Error::PersistenceFailed)?;
+				self.update_recurrence(previous_status, details)?;
 				return Ok(());
 			}
 		}
@@ -502,10 +523,7 @@ impl Bolt12Payment {
 			details.status = RecurrenceStatus::RequiresAttention;
 		}
 		details.transition_id = details.transition_id.saturating_add(1);
-		self.runtime
-			.block_on(self.recurrence_manager.update(details))
-			.map(|_| ())
-			.map_err(|_| Error::PersistenceFailed)
+		self.update_recurrence(previous_status, details)
 	}
 
 	/// Submits the next sequential payment for an active recurring offer.
@@ -523,6 +541,7 @@ impl Bolt12Payment {
 		else {
 			return Err(Error::InvalidOfferId);
 		};
+		let previous_status = details.status;
 		if details.status != RecurrenceStatus::Active {
 			return Err(Error::InvalidOffer);
 		}
@@ -552,7 +571,7 @@ impl Bolt12Payment {
 		if now >= closing {
 			details.status = RecurrenceStatus::Missed;
 			details.transition_id += 1;
-			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			self.update_recurrence(previous_status, details)?;
 			return Err(Error::InvalidOffer);
 		}
 		let amount_msat = details.amount_msat.ok_or(Error::InvalidAmount)?;
@@ -584,7 +603,7 @@ impl Bolt12Payment {
 		if self.runtime.block_on(self.payment_store.insert(payment)).is_err() {
 			details.status = RecurrenceStatus::RequiresAttention;
 			details.transition_id += 1;
-			let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+			self.update_recurrence(previous_status, details)?;
 			return Ok(payment_id);
 		}
 		let optional_params = OptionalOfferPaymentParams {
@@ -619,7 +638,7 @@ impl Bolt12Payment {
 			details.status = RecurrenceStatus::RequiresAttention;
 		}
 		details.transition_id += 1;
-		let _ = self.runtime.block_on(self.recurrence_manager.update(details));
+		self.update_recurrence(previous_status, details)?;
 		Ok(payment_id)
 	}
 
@@ -674,14 +693,13 @@ impl Bolt12Payment {
 			return Err(Error::InvalidOffer);
 		}
 		if details.status != RecurrenceStatus::CancellationPending {
+			let previous_status = details.status;
 			details.status = RecurrenceStatus::CancellationPending;
 			details.cancellation = RecurrenceCancellationState::Pending;
 			details.transition_id += 1;
 			// Persist the pending state before abandoning or notifying the payee so a restart cannot
 			// resume payment while cancellation is being processed.
-			self.runtime
-				.block_on(self.recurrence_manager.update(details.clone()))
-				.map_err(|_| Error::PersistenceFailed)?;
+			self.update_recurrence(previous_status, details.clone())?;
 		}
 
 		if let Some(
@@ -709,9 +727,7 @@ impl Bolt12Payment {
 		details.cancellation = RecurrenceCancellationState::Cancelled;
 		details.transition_id += 1;
 		// Mark the record terminal only after LDK accepts the payee cancellation request.
-		self.runtime
-			.block_on(self.recurrence_manager.update(details))
-			.map_err(|_| Error::PersistenceFailed)?;
+		self.update_recurrence(RecurrenceStatus::CancellationPending, details)?;
 		Ok(())
 	}
 
