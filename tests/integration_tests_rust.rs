@@ -45,6 +45,7 @@ use ldk_node::payment::{
 };
 use ldk_node::{BuildError, Builder, Event, Node, NodeError, ReserveType};
 use lightning::ln::channelmanager::PaymentId;
+use lightning::offers::offer::{OfferBuilder, Recurrence, RecurrencePeriod, RecurrenceType};
 use lightning::routing::gossip::{NodeAlias, NodeId};
 use lightning::routing::router::RouteParametersConfig;
 use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
@@ -3016,6 +3017,107 @@ async fn simple_bolt12_send_receive() {
 		},
 	}
 	assert_eq!(node_a_payments.first().unwrap().amount_msat, Some(overpaid_amount));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn initiate_recurrence_validates_and_persists_failed_attempt() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
+
+	let recurrence = Recurrence {
+		recurrence_type: RecurrenceType::Optional,
+		recurrence_period: RecurrencePeriod::Days(1),
+		recurrence_paywindow: None,
+		recurrence_limit: None,
+	};
+	let offer = OfferBuilder::new(node_b.node_id())
+		.description("recurring payment test".to_string())
+		.amount_msats(100_000)
+		.recurrence(recurrence)
+		.build()
+		.unwrap();
+	let zero_amount_offer = OfferBuilder::new(node_b.node_id())
+		.description("variable recurring payment test".to_string())
+		.recurrence(recurrence)
+		.build()
+		.unwrap();
+
+	let non_recurring_offer = OfferBuilder::new(node_b.node_id())
+		.description("non-recurring test".to_string())
+		.amount_msats(100_000)
+		.build()
+		.unwrap();
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(
+			&non_recurring_offer,
+			None,
+			None,
+			None,
+			None,
+			None
+		),
+		Err(NodeError::InvoiceRequestCreationFailed)
+	);
+	assert!(node_a.list_all_payments().is_empty());
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(&offer, None, Some(0), None, None, None),
+		Err(NodeError::InvalidQuantity)
+	);
+	assert!(node_a.list_all_payments().is_empty());
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(&offer, Some(0), None, None, None, None),
+		Err(NodeError::InvalidAmount)
+	);
+	assert!(node_a.list_all_payments().is_empty());
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(
+			&zero_amount_offer,
+			None,
+			None,
+			None,
+			None,
+			None
+		),
+		Err(NodeError::InvalidAmount)
+	);
+	assert!(node_a.list_all_payments().is_empty());
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(&offer, None, None, None, None, Some(0)),
+		Err(NodeError::InvoiceRequestCreationFailed)
+	);
+	assert!(node_a.list_all_payments().is_empty());
+
+	// With no peer route, submission fails after validation. Keep a failed payment record so the
+	// attempted request remains visible to the caller.
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(
+			&offer,
+			None,
+			None,
+			Some("initial payment".to_string()),
+			None,
+			None
+		),
+		Err(NodeError::InvoiceRequestCreationFailed)
+	);
+	let payments = node_a.list_all_payments();
+	assert_eq!(payments.len(), 1);
+	assert_eq!(payments[0].amount_msat, Some(100_000));
+	assert_eq!(payments[0].direction, PaymentDirection::Outbound);
+	assert_eq!(payments[0].status, PaymentStatus::Failed);
+	assert!(matches!(
+		payments[0].kind,
+		PaymentKind::Bolt12Offer { offer_id, quantity: None, payer_note: Some(ref note), .. }
+			if offer_id == offer.id() && note.0 == "initial payment"
+	));
+
+	node_a.stop().unwrap();
+	assert_eq!(
+		node_a.bolt12_payment().initiate_recurrence(&offer, None, None, None, None, None),
+		Err(NodeError::NotRunning)
+	);
+	node_b.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
