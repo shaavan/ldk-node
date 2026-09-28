@@ -24,6 +24,8 @@ use lightning::events::{
 };
 use lightning::ln::channelmanager::{PaymentId, TrustedChannelFeatures};
 use lightning::ln::types::ChannelId;
+use lightning::offers::invoice::Bolt12Invoice;
+use lightning::offers::offer::Offer;
 use lightning::routing::gossip::NodeId;
 use lightning::sign::EntropySource;
 use lightning::util::config::{ChannelConfigOverrides, ChannelConfigUpdate};
@@ -48,6 +50,7 @@ use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
+use crate::payment::recurrence::{RecurrencePaymentState, RecurrenceStatus};
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -692,6 +695,77 @@ where
 				compute_opening_fee(amount_msat, 0, max_prop_fee)
 			})
 		})
+	}
+
+	/// Processes a successful payment event for an outbound recurrence.
+	async fn advance_recurrence_on_payment_sent(
+		&self, payment_id: PaymentId, invoice: &Bolt12Invoice,
+	) -> Result<(), ReplayEvent> {
+		let mut matches = self
+			.recurrence_store
+			.list_filter(|details| {
+				details.payment_state == RecurrencePaymentState::Active(payment_id)
+			})
+			.await
+			.into_iter();
+
+		let Some(details) = matches.next() else {
+			// Ordinary payments have no recurrence state.
+			return Ok(());
+		};
+
+		if matches.len() != 0 {
+			debug_assert!(false, "multiple recurrences have the same active payment ID?");
+			return Ok(());
+		}
+
+		let Some(invoice_recurrence) = invoice.invoice_recurrence() else {
+			debug_assert!(false, "Invoice that should be corresponding to recurrence according to our recurrence store doesn't?");
+			return Ok(());
+		};
+
+		match self
+			.recurrence_store
+			.mutate_async(&details.id, |current| async move {
+				let Some(mut updated) = current else {
+					log_error!(
+						self.logger,
+						"Recurrence disappeared before its payment update was stored"
+					);
+					return Err(Error::InvalidRecurrenceId);
+				};
+				// Recheck under the mutation lock before advancing the current record.
+				if updated.payment_state != RecurrencePaymentState::Active(payment_id) {
+					return Ok(None);
+				}
+
+				let offer = Offer::try_from(updated.original_offer.clone())
+					.map_err(|_| Error::InvalidOffer)?;
+				updated.paid_count = updated.paid_count.saturating_add(1);
+				updated.basetime.get_or_insert(invoice_recurrence.recurrence_basetime());
+				updated.opaque_state =
+					invoice_recurrence.recurrence_next_state().map(|state| state.to_vec());
+				updated.last_successful_payment_id = Some(payment_id);
+				updated.payment_state = RecurrencePaymentState::NoActivePayment;
+
+				let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+				let period_index = recurrence
+					.period_index(updated.paid_count as u32, updated.initial_start)
+					.map_err(|_| Error::InvalidOffer)?;
+				if recurrence.recurrence_limit.map(|limit| period_index >= limit.0).unwrap_or(false)
+				{
+					updated.status = RecurrenceStatus::Completed;
+				}
+				Ok(Some(updated))
+			})
+			.await
+		{
+			Ok(_) => Ok(()),
+			Err(e) => {
+				log_error!(self.logger, "Failed to store updated recurrence: {}", e);
+				Err(ReplayEvent())
+			},
+		}
 	}
 
 	async fn resolve_inbound_payment_id(
@@ -1412,6 +1486,17 @@ where
 					status: Some(PaymentStatus::Succeeded),
 					..PaymentDetailsUpdate::new(payment_id)
 				};
+
+				if let Some(invoice) =
+					bolt12_invoice.as_ref().and_then(|paid_invoice| paid_invoice.bolt12_invoice())
+				{
+					if let Err(e) =
+						self.advance_recurrence_on_payment_sent(payment_id, invoice).await
+					{
+						log_error!(self.logger, "Failed to advance recurrence: replaying event");
+						return Err(e);
+					}
+				}
 
 				match self.payment_store.update(update).await {
 					Ok(_) => {},
