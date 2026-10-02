@@ -29,6 +29,7 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
 pub use lightning::ln::types::ChannelId;
 use lightning::offers::invoice::Bolt12Invoice as LdkBolt12Invoice;
+use lightning::offers::invoice_request::RecurrenceId;
 pub use lightning::offers::offer::OfferId;
 use lightning::offers::offer::{Amount as LdkAmount, Offer as LdkOffer};
 use lightning::offers::payer_proof::{
@@ -1044,6 +1045,22 @@ uniffi::custom_type!(OfferId, String, {
 	},
 });
 
+uniffi::custom_type!(RecurrenceId, String, {
+	remote,
+	try_lift: |val| {
+		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
+			let bytes_res = bytes_vec.try_into();
+			if let Ok(bytes) = bytes_res {
+				return Ok(RecurrenceId(bytes));
+			}
+		}
+		Err(Error::InvalidRecurrenceId.into())
+	},
+	lower: |obj| {
+		hex_utils::to_string(&obj.0)
+	},
+});
+
 uniffi::custom_type!(PaymentId, String, {
 	remote,
 	try_lift: |val| {
@@ -1509,8 +1526,12 @@ impl Bolt11Invoice {
 			.collect()
 	}
 
-	/// Recover the payee's public key (only to be used if none was included in the invoice)
-	pub fn recover_payee_pub_key(&self) -> PublicKey {
+	/// Recover the payee's public key (only to be used if none was included in the invoice).
+	///
+	/// Signature recovery can fail if the invoice does not contain enough information to recover
+	/// the key; `None` indicates that recovery failed. Callers needing the invoice's effective
+	/// payee key should use the appropriate non-recovery accessor when available.
+	pub fn recover_payee_pub_key(&self) -> Option<PublicKey> {
 		self.inner.recover_payee_pub_key()
 	}
 }

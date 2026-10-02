@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{OutPoint, ScriptBuf};
 use lightning::chain::chainmonitor;
-use lightning::impl_writeable_tlv_based;
+use lightning::impl_ser_tlv_based;
 use lightning::ln::channel_state::{
 	ChannelDetails as LdkChannelDetails, ChannelShutdownState, CounterpartyForwardingInfo,
 };
@@ -42,6 +42,7 @@ use crate::fee_estimator::OnchainFeeEstimator;
 use crate::ffi::maybe_wrap;
 use crate::logger::Logger;
 use crate::message_handler::NodeCustomMessageHandler;
+use crate::payment::recurrence::RecurrenceDetails;
 use crate::payment::{PaymentDetails, PendingPaymentDetails};
 use crate::runtime::RuntimeSpawner;
 
@@ -333,6 +334,8 @@ pub(crate) type BumpTransactionEventHandler =
 	>;
 
 pub(crate) type PaymentStore = DataStore<PaymentDetails, Arc<Logger>, KeepLeastRecentlyUsed>;
+
+pub(crate) type RecurrenceStore = DataStore<RecurrenceDetails, Arc<Logger>, KeepAllEntries>;
 
 /// A local, potentially user-provided, identifier of a channel.
 ///
@@ -703,7 +706,7 @@ pub struct CustomTlvRecord {
 	pub value: Vec<u8>,
 }
 
-impl_writeable_tlv_based!(CustomTlvRecord, {
+impl_ser_tlv_based!(CustomTlvRecord, {
 	(0, type_num, required),
 	(2, value, required),
 });
