@@ -768,6 +768,55 @@ where
 		}
 	}
 
+	/// Marks the unique recurrence with this active payment ID as failed.
+	///
+	/// Leaves unrelated or already-handled attempts unchanged and requests event
+	/// replay if the recurrence update cannot be persisted.
+	async fn update_recurrence_on_payment_failed(
+		&self, payment_id: PaymentId,
+	) -> Result<(), ReplayEvent> {
+		let recurrence_id = match self
+			.recurrence_store
+			.list_filter(|details| {
+				details.payment_state == RecurrencePaymentState::Active(payment_id)
+			})
+			.await
+			.as_slice()
+		{
+			[] => return Ok(()),
+			[details] => details.id,
+			_ => {
+				debug_assert!(false, "multiple recurrences have the same active payment ID?");
+				return Ok(());
+			},
+		};
+
+		self.recurrence_store
+			.mutate_async(&recurrence_id, |current| async move {
+				let Some(mut updated) = current else {
+					log_error!(
+						self.logger,
+						"Recurrence disappeared before its failed payment update was stored"
+					);
+					return Err(Error::InvalidRecurrenceId);
+				};
+				// Recheck under the mutation lock so stale or replayed failures
+				// cannot overwrite an already-handled or newer attempt.
+				if updated.payment_state != RecurrencePaymentState::Active(payment_id) {
+					return Ok(None);
+				}
+				updated.payment_state = RecurrencePaymentState::Failed(payment_id);
+				Ok(Some(updated))
+			})
+			.await
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to store updated recurrence: {}", e);
+				ReplayEvent()
+			})?;
+
+		Ok(())
+	}
+
 	async fn resolve_inbound_payment_id(
 		&self, event_payment_id: Option<PaymentId>, payment_hash: &PaymentHash,
 	) -> Result<(PaymentId, Option<PaymentDetails>), ReplayEvent> {
@@ -1556,6 +1605,8 @@ where
 					payment_id,
 					reason
 				);
+
+				self.update_recurrence_on_payment_failed(payment_id).await?;
 
 				let update = PaymentDetailsUpdate {
 					hash: Some(payment_hash),
