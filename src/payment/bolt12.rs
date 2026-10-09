@@ -19,7 +19,9 @@ use lightning::ln::channelmanager::{
 };
 use lightning::ln::outbound_payment::Retry;
 use lightning::offers::invoice_request::RecurrenceId;
-use lightning::offers::offer::{Amount, Offer as LdkOffer, OfferFromHrn, Quantity, RecurrenceType};
+use lightning::offers::offer::{
+	Amount, Offer as LdkOffer, OfferFromHrn, Quantity, Recurrence, RecurrenceType,
+};
 use lightning::offers::parse::Bolt12SemanticError;
 use lightning::offers::payer_proof::PaidBolt12Invoice as LdkPaidBolt12Invoice;
 #[cfg(not(feature = "uniffi"))]
@@ -33,6 +35,7 @@ use lightning_types::payment::PaymentPreimage;
 use lightning_types::string::UntrustedString;
 
 use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
+use crate::data_store::{DataStoreUpdateResult, StorableObject};
 use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
@@ -264,6 +267,176 @@ impl Bolt12Payment {
 		}
 
 		res
+	}
+
+	/// Submits the next sequential payment for an active recurring offer.
+	///
+	/// The initial payment must have succeeded, no payment may be in progress, and the next
+	/// period's payment window must be open. Failed attempts may be retried within that window.
+	///
+	/// Returns the [`PaymentId`] when the invoice request is successfully submitted. This does
+	/// not indicate that the payment has succeeded; inspect its payment record for the outcome.
+	/// Synchronous submission failures return an error.
+	pub fn pay_next_recurrence(&self, recurrence_id: RecurrenceId) -> Result<PaymentId, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let details = self
+			.runtime
+			.block_on(self.recurrence_store.get(&recurrence_id))?
+			.ok_or(Error::InvalidRecurrenceId)?;
+
+		// Sanity Checks
+		if details.status != RecurrenceStatus::Active {
+			log_error!(self.logger, "Cannot pay the next recurrence: recurrence is not active.");
+			return Err(Error::InvalidRecurrence);
+		}
+
+		if matches!(details.payment_state, RecurrencePaymentState::Active(_)) {
+			log_error!(
+				self.logger,
+				"Cannot pay the next recurrence: a payment is already active for the current period."
+			);
+			return Err(Error::PaymentSendingFailed);
+		}
+
+		if details.paid_count == 0 {
+			log_error!(
+				self.logger,
+				"Cannot pay the next recurrence before the initial payment succeeds."
+			);
+			return Err(Error::InvalidRecurrence);
+		}
+
+		self.runtime.block_on(self.submit_recurrence_payment(details))
+	}
+
+	async fn submit_recurrence_payment(
+		&self, mut details: RecurrenceDetails,
+	) -> Result<PaymentId, Error> {
+		let recurrence_id = details.id;
+		let offer =
+			LdkOffer::try_from(details.original_offer.clone()).map_err(|_| Error::InvalidOffer)?;
+
+		let recurrence = offer.offer_recurrence().ok_or(Error::InvalidOffer)?;
+
+		self.validate_recurrence_payment_window(&details, &recurrence)?;
+
+		let payment_id = PaymentId(self.keys_manager.get_secure_random_bytes());
+
+		let params = RecurrencePaymentParams {
+			counter: details.paid_count,
+			start: details.initial_start,
+			prev_state: details.opaque_state.clone(),
+			quantity: details.quantity,
+			expected_invoice_recurrence_basetime: details.basetime,
+		};
+
+		let optional_params = OptionalOfferPaymentParams {
+			payer_note: details.payer_note.as_ref().map(|note| note.0.clone()),
+			route_params_config: details.routing_override.unwrap_or_default(),
+			retry_strategy: details.retry_policy,
+		};
+
+		let amount_msat = details.amount_msat;
+
+		let (payment_status, payment_state, res) = match self.channel_manager.pay_for_recurrence(
+			&offer,
+			Some(amount_msat),
+			payment_id,
+			recurrence_id,
+			params,
+			optional_params,
+		) {
+			Ok(()) => {
+				(PaymentStatus::Pending, RecurrencePaymentState::Active(payment_id), Ok(payment_id))
+			},
+			Err(e) => {
+				log_error!(self.logger, "Failed to send invoice request: {:?}", e);
+				if matches!(e, Bolt12SemanticError::DuplicatePaymentId) {
+					return Err(Error::DuplicatePayment);
+				}
+				(
+					PaymentStatus::Failed,
+					RecurrencePaymentState::Failed(payment_id),
+					Err(Error::InvoiceRequestCreationFailed),
+				)
+			},
+		};
+
+		let kind = PaymentKind::Bolt12Offer {
+			hash: None,
+			preimage: None,
+			secret: None,
+			offer_id: offer.id(),
+			payer_note: details.payer_note.clone(),
+			quantity: details.quantity,
+		};
+		let payment = PaymentDetails::new(
+			payment_id,
+			kind,
+			Some(amount_msat),
+			None,
+			PaymentDirection::Outbound,
+			payment_status,
+		);
+
+		details.payment_state = payment_state;
+
+		self.payment_store.insert(payment).await?;
+
+		match self.recurrence_store.update(details.to_update()).await? {
+			DataStoreUpdateResult::Updated | DataStoreUpdateResult::Unchanged => {},
+			DataStoreUpdateResult::NotFound => return Err(Error::InvalidRecurrenceId),
+		}
+
+		if res.is_ok() {
+			log_info!(
+				self.logger,
+				"Initiated sending {}msat to {:?}",
+				amount_msat,
+				offer.issuer_signing_pubkey()
+			);
+		}
+
+		res
+	}
+
+	fn validate_recurrence_payment_window(
+		&self, details: &RecurrenceDetails, recurrence: &Recurrence,
+	) -> Result<(), Error> {
+		let period_index = recurrence
+			.period_index(details.paid_count, details.initial_start)
+			.map_err(|_| Error::InvalidOffer)?;
+
+		if recurrence.recurrence_limit.map_or(false, |limit| period_index > limit.0) {
+			debug_assert!(false, "Recurrence exceeded its limit without being marked completed.");
+			return Err(Error::InvalidRecurrence);
+		}
+
+		let basetime = details.basetime.ok_or(Error::InvalidOffer)?;
+
+		let (opening, closing) =
+			recurrence.payment_window(basetime, period_index).map_err(|_| Error::InvalidOffer)?;
+
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+		if now < opening {
+			log_error!(self.logger, "Tried to send recurrence payment too early.");
+			return Err(Error::PaymentSendingFailed);
+		}
+
+		if now >= closing {
+			// TODO: Figure out, where we should ideally be changing recurrence states at appropriate times.
+			debug_assert!(
+				false,
+				"Recurrence crossed the period's closing window without being marked missed."
+			);
+			return Err(Error::InvalidRecurrence);
+		}
+
+		Ok(())
 	}
 
 	pub(crate) fn send_using_amount_inner(

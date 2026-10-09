@@ -177,6 +177,7 @@ enum NodeError {
 	"InvalidOfferId",
 	"InvalidNodeId",
 	"InvalidRecurrenceId",
+	"InvalidRecurrence",
 	"InvalidPaymentId",
 	"InvalidPaymentHash",
 	"InvalidPaymentPreimage",
