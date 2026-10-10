@@ -118,6 +118,9 @@ pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 // The timeout after which we abandon retrying failed payments.
 pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
+// The interval between scans for failed recurrence payment attempts.
+pub(crate) const RECURRENCE_PAYMENT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 // The time in-between peer reconnection attempts.
 pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 

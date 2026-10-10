@@ -135,7 +135,7 @@ use chain::ChainSource;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
-	RGS_SYNC_INTERVAL,
+	RECURRENCE_PAYMENT_RETRY_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -560,6 +560,23 @@ impl Node {
 									).await;
 							}
 						}
+				}
+			}
+		});
+
+		// Regularly retry failed payments for active recurrences.
+		let recurrence_payment = self.bolt12_payment();
+		let mut stop_recurrence_retry = self.stop_sender.subscribe();
+		self.runtime.spawn_cancellable_background_task(async move {
+			let mut interval = tokio::time::interval_at(
+				tokio::time::Instant::now() + RECURRENCE_PAYMENT_RETRY_INTERVAL,
+				RECURRENCE_PAYMENT_RETRY_INTERVAL,
+			);
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tokio::select! {
+					_ = stop_recurrence_retry.changed() => return,
+					_ = interval.tick() => recurrence_payment.retry_failed_recurrences().await,
 				}
 			}
 		});
