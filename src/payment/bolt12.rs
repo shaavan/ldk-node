@@ -439,6 +439,59 @@ impl Bolt12Payment {
 		Ok(())
 	}
 
+	/// Cancels a recurring offer locally and, after the first successful payment, queues a
+	/// continuity-preserving cancellation request for the payee.
+	pub fn cancel_recurrence(&self, recurrence_id: RecurrenceId) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let mut details = self
+			.runtime
+			.block_on(self.recurrence_store.get(&recurrence_id))?
+			.ok_or(Error::InvalidRecurrenceId)?;
+
+		// Sanity Checks
+		if details.status == RecurrenceStatus::Cancelled {
+			log_error!(self.logger, "Tried to cancel an already cancelled recurrence.");
+			return Err(Error::InvalidRecurrence);
+		}
+
+		if details.status == RecurrenceStatus::Completed {
+			log_error!(self.logger, "A completed recurrece cannot be cancelled.");
+			return Err(Error::InvalidRecurrence);
+		}
+
+		if let RecurrencePaymentState::Active(payment_id) = details.payment_state {
+			self.channel_manager.abandon_payment(payment_id);
+			details.payment_state = RecurrencePaymentState::NoActivePayment;
+		}
+
+		if details.paid_count > 0 {
+			// The payee needs the previous recurrence state to authenticate cancellation continuity.
+			let offer = LdkOffer::try_from(details.original_offer.clone())
+				.map_err(|_| Error::InvalidOffer)?;
+			let counter = u32::try_from(details.paid_count).map_err(|_| Error::InvalidAmount)?;
+			let params = lightning::ln::channelmanager::RecurrenceCancellationParams {
+				counter,
+				start: details.initial_start,
+				prev_state: details.opaque_state.clone(),
+			};
+			self.channel_manager
+				.cancel_recurrence(&offer, recurrence_id, params)
+				.map_err(|_| Error::PaymentSendingFailed)?;
+		}
+
+		details.status = RecurrenceStatus::Cancelled;
+
+		match self.runtime.block_on(self.recurrence_store.update(details.to_update()))? {
+			DataStoreUpdateResult::Updated | DataStoreUpdateResult::Unchanged => {},
+			DataStoreUpdateResult::NotFound => return Err(Error::InvalidRecurrenceId),
+		}
+
+		Ok(())
+	}
+
 	pub(crate) fn send_using_amount_inner(
 		&self, offer: &Offer, amount_msat: u64, quantity: Option<u64>, payer_note: Option<String>,
 		route_parameters: Option<RouteParametersConfig>, hrn: Option<HumanReadableName>,
