@@ -165,3 +165,203 @@ impl StorableObjectUpdate<InboundRecurrenceDetails> for InboundRecurrenceDetails
 		StorableObject::id(self)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use bitcoin::Network;
+	use lightning::offers::offer::{
+		RecurrenceBase, RecurrenceLimit, RecurrencePaywindow, RecurrencePeriod, RecurrenceType,
+	};
+	use lightning::util::persist::KVStore;
+	use lightning::util::ser::{Readable, Writeable};
+
+	use super::*;
+	use crate::builder::{BuildError, NodeBuilder};
+	use crate::entropy::NodeEntropy;
+	use crate::io::test_utils::InMemoryStore;
+	use crate::io::{INBOUND_RECURRENCE_PRIMARY_NAMESPACE, INBOUND_RECURRENCE_SECONDARY_NAMESPACE};
+	use crate::types::{DynStore, DynStoreRef, DynStoreWrapper};
+	use crate::Node;
+
+	/// Creates a recurrence with known timing and two completed payments.
+	/// Changing either seed gives a different offer or payer.
+	fn details(offer: u8, payer: u8) -> InboundRecurrenceDetails {
+		let secret = SecretKey::from_slice(&[payer; 32]).unwrap();
+		InboundRecurrenceDetails {
+			offer_id: OfferId([offer; 32]),
+			payer_signing_pubkey: PublicKey::from_secret_key(&Secp256k1::new(), &secret),
+			recurrence: Recurrence {
+				recurrence_type: RecurrenceType::Compulsory(Some(RecurrenceBase {
+					proportional: true,
+					basetime: 1_700_000_000,
+				})),
+				recurrence_period: RecurrencePeriod::Months(1),
+				recurrence_paywindow: Some(RecurrencePaywindow {
+					seconds_before: 60,
+					seconds_after: 120,
+				}),
+				recurrence_limit: Some(RecurrenceLimit(12)),
+			},
+			status: RecurrenceStatus::Active,
+			basetime: Some(1_700_000_000),
+			initial_start: Some(2),
+			claim_status: InboundRecurrenceClaimStatus::Idle,
+			completed_payments: vec![PaymentId([7; 32]), PaymentId([3; 32])],
+		}
+	}
+
+	/// Builds a node without starting it or writing logs.
+	/// Reuses the seed and storage to check that saved records survive rebuilding.
+	fn build_node(store: Arc<DynStore>) -> Result<Node, BuildError> {
+		let mut builder = NodeBuilder::new();
+		builder.set_network(Network::Regtest).set_log_facade_logger();
+		#[cfg(not(feature = "uniffi"))]
+		let entropy = NodeEntropy::from_seed_bytes([42; 64]);
+		#[cfg(feature = "uniffi")]
+		let entropy = NodeEntropy::from_seed_bytes(vec![42; 64]).unwrap();
+		builder.build_with_store(entropy, DynStoreRef(store))
+	}
+
+	/// Checks that saving and reading preserves every status, filled or missing timing, and history.
+	/// Missing bytes must cause an error rather than lose payment history.
+	#[test]
+	fn inbound_recurrence_serialization_preserves_state_and_history() {
+		for status in [
+			RecurrenceStatus::Active,
+			RecurrenceStatus::Missed,
+			RecurrenceStatus::Cancelled,
+			RecurrenceStatus::Completed,
+		] {
+			for claim_status in [
+				InboundRecurrenceClaimStatus::Idle,
+				InboundRecurrenceClaimStatus::Pending(PaymentId([11; 32])),
+				InboundRecurrenceClaimStatus::Failed(PaymentId([13; 32])),
+			] {
+				let mut expected = details(1, 1);
+				expected.status = status;
+				expected.claim_status = claim_status;
+				let encoded = expected.encode();
+				assert_eq!(InboundRecurrenceDetails::read(&mut &encoded[..]).unwrap(), expected);
+				// Reject incomplete data instead of returning a partial record.
+				assert!(InboundRecurrenceDetails::read(&mut &encoded[..encoded.len() - 1]).is_err());
+			}
+		}
+
+		// Missing timing and empty history must stay empty rather than gain invented values.
+		let mut expected = details(1, 1);
+		expected.recurrence.recurrence_type = RecurrenceType::Optional;
+		expected.recurrence.recurrence_paywindow = None;
+		expected.recurrence.recurrence_limit = None;
+		expected.basetime = None;
+		expected.initial_start = None;
+		expected.completed_payments.clear();
+		assert_eq!(InboundRecurrenceDetails::read(&mut &expected.encode()[..]).unwrap(), expected);
+	}
+
+	/// Checks that lookup and listing return all saved recurrences after rebuilding the node.
+	/// Editing a returned copy must not change the stored records.
+	#[test]
+	fn inbound_recurrence_apis_reload_relationships_and_return_copies() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let node = build_node(Arc::clone(&store)).unwrap();
+		let mut expected = vec![details(1, 1), details(1, 2), details(2, 1), details(3, 1)];
+		expected[1].status = RecurrenceStatus::Cancelled;
+		expected[1].claim_status = InboundRecurrenceClaimStatus::Pending(PaymentId([11; 32]));
+		expected[2].status = RecurrenceStatus::Missed;
+		expected[2].claim_status = InboundRecurrenceClaimStatus::Failed(PaymentId([13; 32]));
+		expected[3].status = RecurrenceStatus::Completed;
+		assert!(node.list_inbound_recurrences().is_empty());
+		assert_eq!(
+			node.inbound_recurrence(&expected[0].offer_id, &expected[0].payer_signing_pubkey)
+				.unwrap(),
+			None
+		);
+
+		// Include shared IDs and inactive records so none can be mixed up or left out.
+		for recurrence in &expected {
+			node.runtime
+				.block_on(node.inbound_recurrence_store.insert(recurrence.clone()))
+				.unwrap();
+		}
+		assert!(node.list_payments(None).unwrap().payments.is_empty());
+		// Rebuild with the same storage to check that the records were saved.
+		drop(node);
+		let node = build_node(Arc::clone(&store)).unwrap();
+		for recurrence in &expected {
+			let mut copy = node
+				.inbound_recurrence(&recurrence.offer_id, &recurrence.payer_signing_pubkey)
+				.unwrap()
+				.unwrap();
+			assert_eq!(&copy, recurrence);
+			copy.completed_payments.clear();
+			copy.status = RecurrenceStatus::Active;
+			assert_eq!(
+				node.inbound_recurrence(&recurrence.offer_id, &recurrence.payer_signing_pubkey)
+					.unwrap()
+					.as_ref(),
+				Some(recurrence)
+			);
+		}
+		let mut listed = node.list_inbound_recurrences();
+		assert_eq!(listed.len(), expected.len());
+		for recurrence in &expected {
+			assert!(listed.contains(recurrence));
+		}
+		listed[0].completed_payments.clear();
+		assert!(node.list_inbound_recurrences().iter().all(|r| expected.contains(r)));
+		// Known IDs must not make an unstored offer-and-payer pair match.
+		assert_eq!(
+			node.inbound_recurrence(&expected[3].offer_id, &expected[1].payer_signing_pubkey)
+				.unwrap(),
+			None
+		);
+	}
+
+	/// Checks that an update survives rebuilding without changing another recurrence.
+	/// Fields not changed by the update must keep their saved values.
+	#[test]
+	fn inbound_recurrence_snapshot_update_survives_rebuild() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let node = build_node(Arc::clone(&store)).unwrap();
+		let mut updated = details(1, 1);
+		let other = details(1, 2);
+		for recurrence in [&updated, &other] {
+			node.runtime
+				.block_on(node.inbound_recurrence_store.insert(recurrence.clone()))
+				.unwrap();
+		}
+		updated.status = RecurrenceStatus::Cancelled;
+		updated.claim_status = InboundRecurrenceClaimStatus::Pending(PaymentId([11; 32]));
+		updated.completed_payments.push(PaymentId([17; 32]));
+		node.runtime.block_on(node.inbound_recurrence_store.update(updated.clone())).unwrap();
+		drop(node);
+		let node = build_node(store).unwrap();
+		let listed = node.list_inbound_recurrences();
+		assert_eq!(listed.len(), 2);
+		assert!(listed.contains(&updated));
+		assert!(listed.contains(&other));
+	}
+
+	/// Checks that a corrupt recurrence prevents building the node.
+	/// The node must report the problem instead of silently ignoring saved state.
+	#[test]
+	fn inbound_recurrence_corrupt_record_fails_build() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let node = build_node(Arc::clone(&store)).unwrap();
+		let key = StorableObject::id(&details(1, 1)).encode_to_hex_str();
+		node.runtime
+			.block_on(KVStore::write(
+				&*store,
+				INBOUND_RECURRENCE_PRIMARY_NAMESPACE,
+				INBOUND_RECURRENCE_SECONDARY_NAMESPACE,
+				&key,
+				vec![0xff],
+			))
+			.unwrap();
+		drop(node);
+		assert!(matches!(build_node(store), Err(BuildError::ReadFailed)));
+	}
+}
